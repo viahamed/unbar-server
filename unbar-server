@@ -1,0 +1,1219 @@
+#!/usr/bin/env bash
+# unbar-server — Set up a Soar tunnel server for the Unbar app
+#
+# Soar only, no router and no other tunnel.
+# What it does:
+#   1. Fetches the latest soar-server from the official getlantern/soar GitHub repo
+#      (builds it from source with Go, since the official release has no ready binary)
+#   2. Generates the server Ed25519 key and brings its systemd service up on port 53
+#   3. Gets a Let's Encrypt certificate automatically with Caddy for a subdomain
+#      and serves the subscription file at https://<sub-domain>/<file-name>
+#      (the file name is asked during setup; default sub)
+#   4. Also prints the direct unbar:// link for import into the app
+#
+# Every settings change goes through this script only, and every
+# mutating command calls regen at the end, so the sub file is always up to date.
+# If you change settings by hand, run `unbar-server regen` once.
+#
+# No interference: the tunnel only needs port 53. The subscription file is a simple
+# HTTPS fetch — either this server serves it with Caddy (HTTPS port of
+# your choice, default 443; the certificate is fetched on port 80), or it is
+# only saved and you put it on any other HTTPS host yourself. The script
+# stops or disables no other service; if a port is taken, it says right there
+# whose it is, and you pick another port or take file mode.
+# Works on old and new Linux with systemd (bash 4+).
+#
+# Usage:
+#   sudo unbar-server                  # interactive menu (no arguments; or: sudo unbar-server menu)
+#   sudo unbar                         # interactive menu (same as: sudo unbar-server)
+#   sudo unbar-server setup            # interactive setup (first time)
+#   sudo unbar-server status           # service and settings status
+#   sudo unbar-server show             # print the sub link and the unbar:// link
+#   sudo unbar-server regen            # rebuild the sub file from settings
+#   sudo unbar-server set name ...     # change one setting (name|zone|sub|email|file|https-port)
+#   sudo unbar-server rotate-key       # generate a new key (old configs are invalidated)
+#   sudo unbar-server update           # update soar-server to the latest version
+#   sudo unbar-server logs [soar|caddy]
+#   sudo unbar-server restart
+#   sudo unbar-server uninstall
+#
+# Prerequisites: Linux with systemd, root access, and two DNS records that
+# must exist before setup (setup shows them again at the end):
+#   NS  <zone>        -> <ns-host>      (e.g. NS r.example.com -> ns.example.com)
+#   A   <ns-host>     -> <server IP>    (e.g. A  ns.example.com -> 203.0.113.10)
+#   A   <sub-domain>  -> <server IP>    (e.g. A  sub.example.com -> 203.0.113.10)
+#   (the A record for the subdomain is only needed when this server serves the sub file)
+
+set -euo pipefail
+
+SCRIPT_NAME="unbar-server"
+VERSION="1"
+
+ETC_DIR="/etc/unbar-server"
+SETTINGS_FILE="$ETC_DIR/settings"
+KEY_FILE="$ETC_DIR/key"
+PUBKEY_FILE="$ETC_DIR/pubkey"
+LINK_FILE="$ETC_DIR/unbar-link.txt"
+WEB_ROOT="/var/www/unbar-sub"
+CADDYFILE="$ETC_DIR/Caddyfile"
+SOAR_UNIT="/etc/systemd/system/unbar-soar.service"
+CADDY_UNIT="/etc/systemd/system/unbar-caddy.service"
+BIN_DIR="/usr/local/bin"
+
+SOAR_REPO="getlantern/soar"
+CADDY_REPO="caddyserver/caddy"
+SOAR_FALLBACK_TAG="v0.2.5"
+
+# ---------- Messages ----------
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[1;36m'
+NC='\033[0m'
+
+info()  { echo -e "${GREEN}[+]${NC} $1"; }
+warn()  { echo -e "${YELLOW}[!]${NC} $1"; }
+error() { echo -e "${RED}[-]${NC} $1" >&2; }
+die()   { error "$1"; exit 1; }
+
+# ---------- Small helpers ----------
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+need_root() {
+    [[ $EUID -eq 0 ]] || die "Must run as root (sudo)"
+}
+
+need_systemd() {
+    have systemctl || die "systemd not found; this script only works on Linux with systemd"
+}
+
+# CPU architecture in Go and Caddy terms
+detect_arch() {
+    local m
+    m="$(uname -m)"
+    case "$m" in
+        x86_64|amd64)   echo "amd64" ;;
+        aarch64|arm64)  echo "arm64" ;;
+        armv7l|armv6l)  echo "armv7" ;;
+        *) die "Unsupported architecture: $m (only amd64/arm64/armv7)" ;;
+    esac
+}
+
+go_arch() {
+    case "$(detect_arch)" in
+        amd64) echo "amd64" ;;
+        arm64) echo "arm64" ;;
+        armv7) echo "armv6l" ;;  # the armv6l binary also works on armv7
+    esac
+}
+
+# Latest tag of a GitHub repo; returns the fallback if the API is unavailable
+latest_tag() {
+    local repo="$1" fallback="$2" tag
+    tag="$(curl -fsSL "https://api.github.com/repos/$repo/releases/latest" 2>/dev/null \
+        | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4 || true)"
+    if [[ -z "$tag" ]]; then
+        warn "Could not get the latest version of $repo from GitHub; using $fallback"
+        tag="$fallback"
+    fi
+    echo "$tag"
+}
+
+# Read/write settings (the settings file is sourced; values are stored with %q)
+load_settings() {
+    [[ -f "$SETTINGS_FILE" ]] || die "Setup has not run yet; first: sudo $SCRIPT_NAME setup"
+    # shellcheck disable=SC1090
+    source "$SETTINGS_FILE"
+    : "${ZONE:?ZONE is missing from settings}"
+    # SUB_DOMAIN stays empty in file mode (the file is not served on this server)
+    : "${SUB_DOMAIN:=}" "${NAME:=Break The Barriers}" "${EMAIL:=}" "${SUB_FILE:=sub}" "${SERVE_MODE:=caddy}" "${HTTPS_PORT:=443}"
+}
+
+get_setting() {  # get_setting KEY -> value or empty string
+    local key="$1"
+    [[ -f "$SETTINGS_FILE" ]] || return 0
+    # shellcheck disable=SC1090
+    ( source "$SETTINGS_FILE"; printf '%s' "${!key:-}" )
+}
+
+set_setting() {  # set_setting KEY VALUE
+    local key="$1" value="$2" tmp
+    mkdir -p "$ETC_DIR"
+    tmp="$(mktemp)"
+    if [[ -f "$SETTINGS_FILE" ]]; then
+        grep -v "^${key}=" "$SETTINGS_FILE" > "$tmp" || true
+    fi
+    printf '%s=%q\n' "$key" "$value" >> "$tmp"
+    mv "$tmp" "$SETTINGS_FILE"
+    chmod 600 "$SETTINGS_FILE"
+}
+
+# Interactive prompt with a default: ask "text" "default" -> answer in REPLY
+ask() {
+    local prompt="$1" def="$2" ans
+    if [[ -n "$def" ]]; then
+        printf '%s [%s]: ' "$prompt" "$def" >&2
+    else
+        printf '%s: ' "$prompt" >&2
+    fi
+    read -r ans || true
+    REPLY="${ans:-$def}"
+}
+
+ask_yes_no() {  # ask_yes_no "text" "y|n" -> 0 means yes
+    local prompt="$1" def="$2" ans
+    printf '%s [%s]: ' "$prompt" "$def" >&2
+    read -r ans || true
+    ans="${ans:-$def}"
+    [[ "$ans" == "y" || "$ans" == "Y" ]]
+}
+
+valid_domain() {  # a simple valid domain (lowercase, dots, hyphens)
+    [[ "$1" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]
+}
+
+valid_subfile() {  # subscription file name: letters/digits/dot/hyphen/underscore, no slash
+    [[ "$1" =~ ^[a-zA-Z0-9._-]+$ ]] && [[ "$1" != "." && "$1" != ".." ]]
+}
+
+# ---------- Install prerequisites ----------
+
+install_prereqs() {
+    local missing=()
+    for c in curl tar; do
+        have "$c" || missing+=("$c")
+    done
+    if [[ ${#missing[@]} -eq 0 ]]; then
+        info "Required tools (curl, tar) are present"
+        return 0
+    fi
+    warn "Installing missing tools: ${missing[*]}"
+    if have apt-get; then
+        apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl ca-certificates tar "${missing[@]}"
+    elif have dnf; then
+        dnf install -y -q curl ca-certificates tar "${missing[@]}"
+    elif have yum; then
+        yum install -y -q curl ca-certificates tar "${missing[@]}"
+    elif have pacman; then
+        pacman -Sy --noconfirm curl ca-certificates tar "${missing[@]}"
+    elif have apk; then
+        apk add --no-cache curl ca-certificates tar "${missing[@]}"
+    elif have zypper; then
+        zypper --non-interactive install curl ca-certificates tar "${missing[@]}"
+    else
+        die "No known package manager found; install manually: ${missing[*]}"
+    fi
+    for c in "${missing[@]}"; do
+        have "$c" || die "Installing $c failed"
+    done
+}
+
+# ---------- Go ----------
+
+GO_MIN_MAJOR=1
+GO_MIN_MINOR=25
+GO_FALLBACK_VER="go1.25.0"  # if go.dev is unavailable, this version is downloaded directly
+
+go_is_ok() {
+    have go || return 1
+    local ver
+    ver="$(go version 2>/dev/null | grep -o 'go[0-9]*\.[0-9]*' | head -1 | cut -c3- || true)"
+    [[ -z "$ver" ]] && return 1
+    local major="${ver%%.*}" minor="${ver#*.}"
+    [[ "$major" -gt "$GO_MIN_MAJOR" ]] || { [[ "$major" -eq "$GO_MIN_MAJOR" ]] && [[ "$minor" -ge "$GO_MIN_MINOR" ]]; }
+}
+
+install_go() {
+    if go_is_ok; then
+        info "Go is present: $(go version)"
+        return 0
+    fi
+    local dl_json ver tarball url go_dir
+    info "Installing Go (needed to build soar-server)..."
+    dl_json="$(curl -fsSL "https://go.dev/dl/?mode=json" 2>/dev/null | head -c 200000 || true)"
+    ver="$(printf '%s' "$dl_json" | grep -o '"version": *"go[0-9.]*"' | head -1 | grep -o 'go[0-9.]*' || true)"
+    if [[ -z "$ver" ]]; then
+        warn "Could not get the Go version from go.dev; using $GO_FALLBACK_VER"
+        ver="$GO_FALLBACK_VER"
+    fi
+    tarball="$ver.linux-$(go_arch).tar.gz"
+    url="https://go.dev/dl/$tarball"
+    # If an old Go is in /usr/local/go, we do not remove the user's one —
+    # the fresh version goes elsewhere and only this script's PATH sees it
+    go_dir="/usr/local/go"
+    if [[ -x "$go_dir/bin/go" ]]; then
+        go_dir="/usr/local/unbar-go"
+        warn "An old Go is in /usr/local/go; the fresh version will be installed in $go_dir (the current Go is untouched)"
+    elif [[ -e "$go_dir" && ! -e "$go_dir/VERSION" && ! -d "$go_dir/bin" ]]; then
+        go_dir="/usr/local/unbar-go"
+    fi
+    info "Downloading $tarball ..."
+    curl -fsSL "$url" -o "/tmp/$tarball"
+    rm -rf "$go_dir"
+    tar -C /usr/local -xzf "/tmp/$tarball"
+    if [[ "$go_dir" != "/usr/local/go" ]]; then
+        mv /usr/local/go "$go_dir"
+    fi
+    rm -f "/tmp/$tarball"
+    export PATH="$go_dir/bin:$PATH"
+    # Global symlink only if there is no go in /usr/local/bin (we do not move the user's Go)
+    [[ -e /usr/local/bin/go ]] || ln -sf "$go_dir/bin/go" /usr/local/bin/go 2>/dev/null || true
+    [[ -e /usr/local/bin/gofmt ]] || ln -sf "$go_dir/bin/gofmt" /usr/local/bin/gofmt 2>/dev/null || true
+    go_is_ok || die "Go installation failed"
+    info "Go installed: $(go version)"
+}
+
+# ---------- soar-server ----------
+
+installed_soar_tag() { get_setting SOAR_TAG; }
+
+install_soar() {
+    local tag="$1"
+    info "Building soar-server @$tag from official source..."
+    export PATH="/usr/local/go/bin:$PATH"
+    export GOTOOLCHAIN=local
+    export CGO_ENABLED=0
+    GOBIN="$BIN_DIR" go install "github.com/$SOAR_REPO/cmd/soar-server@$tag" \
+        || die "Building soar-server failed"
+    [[ -x "$BIN_DIR/soar-server" ]] || die "soar-server binary was not built"
+    set_setting SOAR_TAG "$tag"
+    info "soar-server installed: $($BIN_DIR/soar-server 2>&1 | head -1 || true)"
+}
+
+# ---------- Caddy ----------
+
+CADDY_FALLBACK_TAG="v2.11.9"  # version tested on the server; if the GitHub API is unavailable
+
+# Which Caddy binary to run: ours first, then the system one
+resolve_caddy_bin() {
+    if [[ -x "$BIN_DIR/unbar-caddy" ]]; then echo "$BIN_DIR/unbar-caddy";
+    elif [[ -x "$BIN_DIR/caddy" ]]; then echo "$BIN_DIR/caddy";
+    elif have caddy; then command -v caddy;
+    else die "Caddy binary not found; run setup first"; fi
+}
+
+install_caddy() {
+    local ver
+    if have caddy; then
+        ver="$(caddy version 2>/dev/null | head -1 || true)"
+        if [[ "$ver" == v2* ]]; then
+            info "Caddy is present: $ver (using it: $(command -v caddy))"
+            return 0
+        fi
+        warn "The installed Caddy is old ($ver); version 2 will be installed separately (the current binary is untouched)"
+    fi
+    local tag arch asset_url tmp
+    arch="$(detect_arch)"
+    tag="$(latest_tag "$CADDY_REPO" "$CADDY_FALLBACK_TAG")"
+    [[ -n "$tag" ]] || die "Could not get the Caddy version from GitHub"
+    local ver_tag="${tag#v}"
+    # Caddy release file name: caddy_2.x.y_linux_amd64.tar.gz (underscores, not hyphens)
+    asset_url="$(curl -fsSL "https://api.github.com/repos/$CADDY_REPO/releases/tags/$tag" \
+        | grep -o "\"browser_download_url\": *\"[^\"]*linux_${arch}.tar.gz\"" | head -1 | cut -d'"' -f4 || true)"
+    [[ -n "$asset_url" ]] || die "No Caddy file found for linux-$arch"
+    info "Downloading Caddy $tag ..."
+    tmp="$(mktemp -d)"
+    curl -fsSL "$asset_url" -o "$tmp/caddy.tar.gz"
+    tar -C "$tmp" -xzf "$tmp/caddy.tar.gz" caddy
+    if [[ ! -e "$BIN_DIR/caddy" ]]; then
+        install -m 755 "$tmp/caddy" "$BIN_DIR/caddy"
+    else
+        # Another caddy is here (e.g. the user's version 1); ours goes separately
+        install -m 755 "$tmp/caddy" "$BIN_DIR/unbar-caddy"
+    fi
+    rm -rf "$tmp"
+    local caddy_bin
+    caddy_bin="$(resolve_caddy_bin)"
+    info "Caddy installed: $($caddy_bin version 2>/dev/null | head -1)"
+}
+
+# ---------- Server key ----------
+
+generate_key() {
+    local priv pub
+    info "Generating the server Ed25519 key..."
+    umask 077
+    local out
+    out="$("$BIN_DIR/soar-server" keygen)" || die "keygen failed"
+    priv="$(printf '%s' "$out" | awk '$1 == "private" { print $2 }')"
+    pub="$(printf '%s' "$out" | awk '$1 == "public" { print $2 }')"
+    [[ -n "$priv" && -n "$pub" ]] || die "keygen output was unreadable"
+    printf '%s' "$priv" > "$KEY_FILE"
+    printf '%s' "$pub" > "$PUBKEY_FILE"
+    chmod 600 "$KEY_FILE"
+    chmod 644 "$PUBKEY_FILE"
+    chown "$SOAR_USER:$SOAR_USER" "$KEY_FILE" 2>/dev/null || true
+    info "Key generated; public key: $pub"
+}
+
+# ---------- Sub file and unbar:// link ----------
+
+# One server's JSON, with exactly the fields the app reads:
+# v, name, zone, pubkey, resolverMode, resolvers, country
+server_json() {
+    local name="$1" zone="$2" pubkey="$3"
+    if have python3; then
+        python3 -c 'import json,sys; print(json.dumps({"v":1,"name":sys.argv[1],"zone":sys.argv[2],"pubkey":sys.argv[3],"resolverMode":"DISCOVERY","resolvers":[],"country":"IR"}, separators=(",",":"), ensure_ascii=False))' \
+            "$name" "$zone" "$pubkey"
+    else
+        local safe_name="${name//\\/\\\\}"
+        safe_name="${safe_name//\"/\\\"}"
+        printf '{"v":1,"name":"%s","zone":"%s","pubkey":"%s","resolverMode":"DISCOVERY","resolvers":[],"country":"IR"}' \
+            "$safe_name" "$zone" "$pubkey"
+    fi
+}
+
+# HTTPS address of the sub file (port 443 is omitted from the address)
+sub_url() {
+    if [[ "${HTTPS_PORT:-443}" == "443" ]]; then
+        echo "https://$SUB_DOMAIN/$SUB_FILE"
+    else
+        echo "https://$SUB_DOMAIN:$HTTPS_PORT/$SUB_FILE"
+    fi
+}
+
+regen_sub() {
+    load_settings
+    local pubkey json link url
+    [[ -f "$PUBKEY_FILE" ]] || die "Public key not found; run setup or rotate-key first"
+    pubkey="$(cat "$PUBKEY_FILE")"
+    [[ -n "$pubkey" ]] || die "Public key file is empty"
+    json="$(server_json "$NAME" "$ZONE" "$pubkey")"
+    mkdir -p "$WEB_ROOT"
+    local tmp
+    tmp="$(mktemp "$WEB_ROOT/.sub.XXXXXX")"
+    printf '[%s]\n' "$json" > "$tmp"
+    chmod 644 "$tmp"
+    mv "$tmp" "$WEB_ROOT/$SUB_FILE"
+    # The same content is also served with a .txt suffix (some clients/browsers
+    # are not comfortable with an extensionless file)
+    cp "$WEB_ROOT/$SUB_FILE" "$WEB_ROOT/$SUB_FILE.txt"
+    chmod 644 "$WEB_ROOT/$SUB_FILE.txt"
+    link="unbar://$(printf '%s' "$json" | base64 | tr -d '\n' | tr '+/' '-_' | tr -d '=')"
+    printf '%s\n' "$link" > "$LINK_FILE"
+    chmod 600 "$LINK_FILE"
+    if [[ "${SERVE_MODE:-caddy}" == "caddy" ]]; then
+        url="$(sub_url)"
+        info "Sub file rebuilt: $url"
+    else
+        info "Sub file saved: $WEB_ROOT/$SUB_FILE (put it on an HTTPS host yourself)"
+    fi
+}
+
+# ---------- Old systemd compatibility ----------
+# AmbientCapabilities exists from systemd 229 on; on older systemd
+# services run as root (otherwise they cannot listen on 53/80/443)
+systemd_version() {  # systemd version number, or 0
+    local v
+    v="$(systemctl --version 2>/dev/null | head -1 | grep -o '[0-9]*' | head -1 || true)"
+    echo "${v:-0}"
+}
+
+run_user() {  # run_user unbar -> service run user
+    if [[ "$(systemd_version)" -ge 229 ]]; then echo "$1"; else echo "root"; fi
+}
+
+ambient_caps_line() {  # AmbientCapabilities line, or an empty string
+    if [[ "$(systemd_version)" -ge 229 ]]; then echo "AmbientCapabilities=CAP_NET_BIND_SERVICE"; fi
+}
+
+# ---------- Services ----------
+
+SOAR_USER="unbar"
+CADDY_USER="caddy"
+
+nologin_path() { command -v nologin 2>/dev/null || echo /bin/false; }
+
+ensure_users() {
+    local u
+    for u in "$SOAR_USER" "$CADDY_USER"; do
+        if id -u "$u" >/dev/null 2>&1; then continue; fi
+        if have useradd; then
+            useradd --system --no-create-home --shell "$(nologin_path)" "$u"
+        elif have adduser; then
+            adduser -S -D -H -s "$(nologin_path)" "$u" 2>/dev/null \
+                || adduser -S -D -s "$(nologin_path)" "$u" \
+                || die "Creating system user $u failed; create it manually"
+        else
+            die "Neither useradd nor adduser exists; create system user $u manually"
+        fi
+    done
+    # The Caddy directories belong to Unbar, not the system Caddy paths
+    # (/etc/caddy and /var/lib/caddy), so they do not clash with another installed Caddy
+    mkdir -p "$ETC_DIR" "$WEB_ROOT" /var/lib/unbar-caddy "$ETC_DIR/caddy"
+    chown "$SOAR_USER:$SOAR_USER" "$ETC_DIR" 2>/dev/null || true
+    chown "$CADDY_USER:$CADDY_USER" /var/lib/unbar-caddy "$ETC_DIR/caddy" "$WEB_ROOT" 2>/dev/null || true
+    chmod 755 "$WEB_ROOT"
+}
+
+write_soar_unit() {
+    load_settings
+    local svc_user caps
+    svc_user="$(run_user "$SOAR_USER")"
+    caps="$(ambient_caps_line)"
+    cat > "$SOAR_UNIT" <<EOF
+[Unit]
+Description=Unbar Soar DNS tunnel server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$svc_user
+Group=$svc_user
+ExecStart=$BIN_DIR/soar-server -zone $ZONE -key-file $KEY_FILE -listen :53
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+$caps
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+}
+
+write_caddyfile() {
+    load_settings
+    {
+        if [[ -n "${EMAIL:-}" ]]; then
+            echo "{"
+            echo "    email $EMAIL"
+            echo "}"
+            echo
+        fi
+        # The HTTPS port goes in the site address; 443 is the default and is not written
+        if [[ "${HTTPS_PORT:-443}" == "443" ]]; then
+            echo "$SUB_DOMAIN {"
+        else
+            echo "$SUB_DOMAIN:$HTTPS_PORT {"
+        fi
+        echo "    root * $WEB_ROOT"
+        echo "    @sub path /$SUB_FILE /$SUB_FILE.txt"
+        echo "    header @sub Cache-Control \"no-store\""
+        echo "    file_server"
+        echo "}"
+    } > "$CADDYFILE"
+    chmod 644 "$CADDYFILE"
+}
+
+write_caddy_unit() {
+    local svc_user caps caddy_bin
+    svc_user="$(run_user "$CADDY_USER")"
+    caps="$(ambient_caps_line)"
+    caddy_bin="$(resolve_caddy_bin)"
+    cat > "$CADDY_UNIT" <<EOF
+[Unit]
+Description=Unbar Caddy (serves the sub file over HTTPS)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$svc_user
+Group=$svc_user
+ExecStart=$caddy_bin run --config $CADDYFILE --adapter caddyfile
+ExecReload=$caddy_bin reload --config $CADDYFILE --adapter caddyfile
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+$caps
+Environment=XDG_DATA_HOME=/var/lib/unbar-caddy
+Environment=XDG_CONFIG_HOME=$ETC_DIR/caddy
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+}
+
+# ---------- Ports: the tunnel only needs 53; the web server (Caddy) is optional ----------
+# The script stops or disables no other service. If a port is taken,
+# it says right there whose it is and does not continue until you decide.
+
+# Names of the processes listening on a port (one per line);
+# falls back to netstat if there is no ss, and returns empty if neither exists
+port_holders() {  # port_holders udp|tcp 53
+    local proto="$1" port="$2" lines
+    if have ss; then
+        lines="$(ss -${proto:0:1}lnpH "sport = :$port" 2>/dev/null \
+            || ss -${proto:0:1}lnp "sport = :$port" 2>/dev/null | tail -n +2 || true)"
+        printf '%s\n' "$lines" | sed -n 's/.*users:(("\([^"]*\)".*/\1/p' | sort -u
+    elif have netstat; then
+        netstat -${proto:0:1}lnp 2>/dev/null | grep ":$port " \
+            | sed -n 's/.*[[:space:]][0-9]*\/\([^[:space:]]*\)[[:space:]]*$/\1/p' | sort -u
+    fi
+}
+
+# Can the server still resolve domain names? (after disabling the resolved stub)
+check_server_dns() {
+    if curl -fsSL --max-time 8 https://go.dev -o /dev/null 2>/dev/null; then
+        info "Server DNS is healthy"
+        return 0
+    fi
+    warn "Server DNS does not work after disabling the stub; adding a public resolver"
+    cp /etc/resolv.conf /etc/resolv.conf.unbar-bak 2>/dev/null || true
+    printf 'nameserver 1.1.1.1\n' >> /etc/resolv.conf 2>/dev/null || true
+    if curl -fsSL --max-time 8 https://go.dev -o /dev/null 2>/dev/null; then
+        info "DNS fixed with 1.1.1.1 (backup: /etc/resolv.conf.unbar-bak)"
+        return 0
+    fi
+    die "Server DNS does not work; check /etc/resolv.conf (it must have a valid nameserver)"
+}
+
+# Check port 53; the usual catch: the systemd-resolved stub listener on 127.0.0.53
+# (this stub belongs to the system itself, not a user service; it is disabled with your confirmation.
+# Any other DNS service holding 53 is untouched — setup stops right there)
+free_port_53() {
+    local holders holder
+    holders="$(port_holders udp 53)"
+    if [[ -z "$holders" ]]; then
+        info "Port 53 is free"
+        return 0
+    fi
+    # our own soar-server (setup run again) — it is replaced at the end
+    if [[ "$holders" == "soar-server" ]]; then
+        info "Port 53 is held by the current soar-server; it will be replaced at the end of setup"
+        return 0
+    fi
+    while read -r holder; do
+        [[ -z "$holder" ]] && continue
+        [[ "$holder" == "soar-server" ]] && continue
+        case "$holder" in
+            systemd-resolve|systemd-resolved)
+                # On Ubuntu there are usually two stubs: 127.0.0.53 and 127.0.0.54 —
+                # both are disabled with DNSStubListener=no
+                warn "Port 53 is held by systemd-resolved (stub)"
+                if ask_yes_no "Disable the stub listener so soar-server can listen on 53?" "y"; then
+                    mkdir -p /etc/systemd/resolved.conf.d
+                    printf '[Resolve]\nDNSStubListener=no\n' > /etc/systemd/resolved.conf.d/unbar-dns.conf
+                    systemctl restart systemd-resolved 2>/dev/null || true
+                    sleep 2
+                    if port_holders udp 53 | grep -q "systemd-resolve"; then
+                        die "Port 53 is still held by systemd-resolved; check the ss output"
+                    fi
+                    info "Port 53 is free now"
+                    check_server_dns
+                else
+                    die "Cannot continue without port 53 being freed"
+                fi
+                ;;
+            *)
+                die "Port 53 is held by $holder; the Soar tunnel needs this port — stop the $holder service manually or set the tunnel up on another server"
+                ;;
+        esac
+    done <<< "$holders"
+}
+
+open_firewall() {  # open_firewall caddy|file [https-port]
+    local mode="${1:-caddy}" https_port="${2:-443}"
+    if have ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
+        ufw allow 53/udp >/dev/null; ufw allow 53/tcp >/dev/null
+        if [[ "$mode" == "caddy" ]]; then
+            ufw allow 80/tcp >/dev/null; ufw allow "$https_port/tcp" >/dev/null
+        fi
+        info "Required ports opened in ufw"
+    elif have firewall-cmd && firewall-cmd --state 2>/dev/null | grep -q running; then
+        firewall-cmd --permanent --add-port=53/udp --add-port=53/tcp >/dev/null
+        if [[ "$mode" == "caddy" ]]; then
+            firewall-cmd --permanent --add-port=80/tcp --add-port="$https_port/tcp" >/dev/null
+        fi
+        firewall-cmd --reload >/dev/null
+        info "Required ports opened in firewalld"
+    else
+        if [[ "$mode" == "caddy" ]]; then
+            warn "No active firewall found; open these ports yourself: 53/udp, 53/tcp, 80/tcp, $https_port/tcp"
+        else
+            warn "No active firewall found; open these ports yourself: 53/udp, 53/tcp"
+        fi
+    fi
+}
+
+# DNS check (only warns, never stops — DNS may not have propagated yet)
+check_dns() {
+    load_settings
+    local parent ns_host
+    parent="${ZONE#*.}"
+    ns_host="${NS_HOST:-ns.$parent}"
+    if ! have dig; then
+        warn "No dig command; skipping the DNS check"
+        return 0
+    fi
+    local ns_ok a_ok sub_ok
+    ns_ok="$(dig +short NS "$ZONE" 2>/dev/null | head -1 || true)"
+    a_ok="$(dig +short A "$ns_host" 2>/dev/null | head -1 || true)"
+    [[ -n "$ns_ok" ]] || warn "NS record for $ZONE is not visible yet (it must point to $ns_host)"
+    [[ -n "$a_ok" ]] || warn "A record for $ns_host is not visible yet (it must point to this server's IP)"
+    if [[ "${SERVE_MODE:-caddy}" == "caddy" ]]; then
+        sub_ok="$(dig +short A "$SUB_DOMAIN" 2>/dev/null | head -1 || true)"
+        [[ -n "$sub_ok" ]] || warn "A record for $SUB_DOMAIN is not visible yet (it must point to this server's IP)"
+        if [[ -n "$ns_ok" && -n "$a_ok" && -n "$sub_ok" ]]; then
+            info "DNS records look correct"
+        fi
+    elif [[ -n "$ns_ok" && -n "$a_ok" ]]; then
+        info "DNS records look correct"
+    fi
+    # This function only warns and never stops setup:
+    # the return value of the last conditional must not become nonzero (set -e)
+    return 0
+}
+
+# ---------- Commands ----------
+
+cmd_setup() {
+    need_root
+    need_systemd
+    if [[ "$(systemd_version)" -lt 229 ]]; then
+        warn "Old systemd ($(systemd_version)); services run as root (AmbientCapabilities exists from 229 on)"
+    fi
+    # Install the script itself in /usr/local/bin so the unbar-server
+    # command is available everywhere after setup (if not run from there)
+    if [[ "$(readlink -f "$0" 2>/dev/null || echo "$0")" != "/usr/local/bin/unbar-server" ]]; then
+        install -m 755 "$0" /usr/local/bin/unbar-server \
+            && info "Script installed at /usr/local/bin/unbar-server" \
+            || warn "Installing the script itself in /usr/local/bin failed"
+    fi
+    # Short command: bare `unbar` opens the menu, same as `unbar-server`
+    ln -sf /usr/local/bin/unbar-server /usr/local/bin/unbar
+    echo
+    echo -e "${CYAN}===============================${NC}"
+    echo -e "${CYAN}  Unbar by Break The Barriers${NC}"
+    echo -e "${CYAN}===============================${NC}"
+    echo -e "${CYAN}Soar server setup for Unbar${NC}"
+    echo "Soar only; no router and no other tunnel."
+    echo
+
+    # All variables are initialized up front: with set -u, reading an
+    # uninitialized local errors with unbound variable; on a fresh install
+    # there is no settings file and the if block above does not run (first-install bug, line 694).
+    # Email is the same: in file mode it is not asked with ask, so
+    # without an initial value, set_setting EMAIL below would have crashed too.
+    local zone="" sub="" name="" email="" ns_host="" parent="" subfile="" serve_mode="" https_port=""
+    if [[ -f "$SETTINGS_FILE" ]]; then
+        warn "Setup has run before; previous values are shown as defaults"
+        zone="$(get_setting ZONE)"; sub="$(get_setting SUB_DOMAIN)"
+        name="$(get_setting NAME)"; email="$(get_setting EMAIL)"
+        subfile="$(get_setting SUB_FILE)"
+        serve_mode="$(get_setting SERVE_MODE)"; https_port="$(get_setting HTTPS_PORT)"
+    fi
+    [[ -n "$serve_mode" ]] || serve_mode="caddy"
+    [[ -n "$https_port" ]] || https_port="443"
+
+    # The zone has no default; it is asked fresh every time
+    ask "Tunnel zone (tunnel subdomain, e.g. r.example.com)" ""
+    zone="$REPLY"
+    valid_domain "$zone" || die "Invalid zone: $zone"
+
+    parent="${zone#*.}"
+    ns_host="ns.$parent"
+
+    # The subscription link is just a simple HTTPS fetch; serving it on this
+    # server is optional — if not, the file is only saved and you put it on any
+    # other HTTPS host yourself (e.g. where your site is)
+    local serve_def="y"
+    [[ "$serve_mode" == "file" ]] && serve_def="n"
+    if ask_yes_no "Serve the sub file on this server with Caddy? (if not, only the file is saved)" "$serve_def"; then
+        serve_mode="caddy"
+    else
+        serve_mode="file"
+    fi
+
+    if [[ "$serve_mode" == "caddy" ]]; then
+        ask "Subdomain for the sub file and certificate (e.g. sub.example.com)" ""
+        sub="$REPLY"
+        valid_domain "$sub" || die "Invalid subdomain: $sub"
+        [[ "$sub" != "$zone" ]] || die "The sub subdomain must not be the same as the zone"
+        case "$sub" in
+            *".$zone") die "The sub subdomain must not be under the tunnel zone (its DNS would go through the tunnel)" ;;
+        esac
+        # The certificate is fetched on port 80; if it is taken, Caddy cannot
+        # get a certificate automatically — so the file is only saved (no service is stopped)
+        local holders80
+        holders80="$(port_holders tcp 80 | tr '\n' ' ')"
+        if [[ -n "$holders80" ]]; then
+            warn "Port 80 is held by $holders80; without it I cannot get a certificate automatically — the file will only be saved"
+            serve_mode="file"
+            sub=""
+        else
+            local def_port="443"
+            [[ -n "$(port_holders tcp 443)" ]] && def_port="8443"
+            ask "HTTPS port for serving the sub file" "$def_port"
+            https_port="$REPLY"
+            [[ "$https_port" =~ ^[0-9]+$ ]] && [[ "$https_port" -ge 1 && "$https_port" -le 65535 ]] || die "Invalid port: $https_port"
+            local holders_hp
+            holders_hp="$(port_holders tcp "$https_port")"
+            if [[ -n "$holders_hp" ]]; then
+                # Our own Caddy (setup run again) is fine
+                if [[ "$holders_hp" == "caddy" ]] && systemctl is-active --quiet unbar-caddy 2>/dev/null; then
+                    info "Port $https_port is held by the current Unbar Caddy; it will be replaced at the end of setup"
+                else
+                    die "Port $https_port is held by $(printf '%s' "$holders_hp" | tr '\n' ' '); pick another free port"
+                fi
+            fi
+        fi
+    else
+        sub=""
+    fi
+
+    if [[ "$serve_mode" == "caddy" ]]; then
+        ask "Subscription file name (served at https://$sub/<name>)" "${subfile:-sub}"
+    else
+        ask "Subscription file name" "${subfile:-sub}"
+    fi
+    subfile="$REPLY"
+    valid_subfile "$subfile" || die "Invalid file name: $subfile"
+
+    ask "Server display name in the app" "${name:-Break The Barriers}"
+    name="$REPLY"
+    [[ -n "$name" ]] || die "Name cannot be empty"
+
+    if [[ "$serve_mode" == "caddy" ]]; then
+        ask "Email for Let's Encrypt (optional, for expiry notices)" "${email:-}"
+        email="$REPLY"
+    fi
+
+
+    echo
+    echo "Before continuing, these DNS records must exist:"
+    echo "  NS  $zone  -> $ns_host"
+    echo "  A   $ns_host  -> <this server's IP>"
+    if [[ "$serve_mode" == "caddy" ]]; then
+        echo "  A   $sub  -> <this server's IP>"
+    fi
+    echo
+    ask_yes_no "I have created the records, continue?" "y" || die "Create the records first, then run setup again"
+
+    set_setting ZONE "$zone"
+    set_setting SUB_DOMAIN "$sub"
+    set_setting SUB_FILE "$subfile"
+    set_setting SERVE_MODE "$serve_mode"
+    set_setting HTTPS_PORT "$https_port"
+    set_setting NAME "$name"
+    set_setting EMAIL "$email"
+    set_setting NS_HOST "$ns_host"
+
+    free_port_53
+    install_prereqs
+    install_go
+    local tag
+    tag="$(latest_tag "$SOAR_REPO" "$SOAR_FALLBACK_TAG")"
+    install_soar "$tag"
+    ensure_users
+    [[ -f "$KEY_FILE" ]] || generate_key
+    write_soar_unit
+    if [[ "$serve_mode" == "caddy" ]]; then
+        install_caddy
+        write_caddyfile
+        write_caddy_unit
+    else
+        # File mode: if our own Caddy is active, turn it off
+        systemctl disable --now unbar-caddy 2>/dev/null || true
+    fi
+    open_firewall "$serve_mode" "$https_port"
+
+    systemctl enable --now unbar-soar 2>/dev/null || systemctl enable unbar-soar || true
+    if [[ "$serve_mode" == "caddy" ]]; then
+        systemctl enable --now unbar-caddy 2>/dev/null || systemctl enable unbar-caddy || true
+    fi
+    sleep 2
+    systemctl restart unbar-soar || warn "Restarting soar failed — check with 'unbar-server logs soar'"
+    if [[ "$serve_mode" == "caddy" ]]; then
+        systemctl restart unbar-caddy || warn "Restarting caddy failed — check with 'unbar-server logs caddy'"
+    fi
+
+    regen_sub
+    check_dns
+
+    echo
+    info "Service status:"
+    systemctl is-active --quiet unbar-soar && info "  soar: active" || warn "  soar: not active — check with 'unbar-server logs soar'"
+    if [[ "$serve_mode" == "caddy" ]]; then
+        systemctl is-active --quiet unbar-caddy && info "  caddy: active" || warn "  caddy: not active — check with 'unbar-server logs caddy'"
+    else
+        info "  caddy: not installed (file mode — the sub file is only saved)"
+    fi
+    echo
+    cmd_show
+    echo
+    if [[ "$serve_mode" == "caddy" ]]; then
+        echo "If the certificate has not been issued yet (DNS just created), wait a few minutes and check status again."
+    else
+        echo "The sub file was saved at $WEB_ROOT/$subfile; put it on an HTTPS host and enter that link in the app."
+    fi
+}
+
+cmd_status() {
+    need_root
+    load_settings
+    echo "Unbar server $VERSION"
+    echo "  Zone:       $ZONE"
+    if [[ "${SERVE_MODE:-caddy}" == "caddy" ]]; then
+        echo "  Subdomain:  $SUB_DOMAIN"
+        echo "  HTTPS port: $HTTPS_PORT"
+    else
+        echo "  Serve mode: file (sub file is only saved, Caddy not installed)"
+    fi
+    echo "  Name:       $NAME"
+    echo "  Soar version: $(installed_soar_tag) (binary: $([ -x $BIN_DIR/soar-server ] && echo present || echo missing))"
+    echo "  Public key: $(cat "$PUBKEY_FILE" 2>/dev/null || echo '—')"
+    echo "  soar:   $(systemctl is-active unbar-soar 2>/dev/null || true)"
+    if [[ "${SERVE_MODE:-caddy}" == "caddy" ]]; then
+        echo "  caddy:  $(systemctl is-active unbar-caddy 2>/dev/null || true)"
+    else
+        echo "  caddy:  not installed (file mode)"
+    fi
+    if [[ "${SERVE_MODE:-caddy}" == "caddy" ]]; then
+        local url
+        url="$(sub_url)"
+        echo "  Sub link: $url"
+        # First check on the server itself (no public DNS): are Caddy + certificate healthy?
+        # (very old curl has no --resolve; then this test is skipped and only the internet test remains)
+        local f
+        if curl --help all 2>/dev/null | grep -q -- '--resolve'; then
+            for f in "$SUB_FILE" "$SUB_FILE.txt"; do
+                if curl -fsSL --max-time 10 --resolve "$SUB_DOMAIN:443:127.0.0.1" "https://$SUB_DOMAIN/$f" >/dev/null 2>&1; then
+                    info "File $f is served on this server (Caddy + certificate healthy)"
+                else
+                    warn "File $f is not served even on this server — see the Caddy log: unbar-server logs caddy"
+                fi
+            done
+        else
+            warn "curl is old and has no --resolve; skipping the local file-serving test"
+        fi
+        # Then from the internet (needs public DNS; the server's own resolver may
+        # be unstable, so failing this test alone means "check from a phone/browser")
+        for f in "$SUB_FILE" "$SUB_FILE.txt"; do
+            if curl -fsSL --max-time 10 "https://$SUB_DOMAIN/$f" >/dev/null 2>&1; then
+                info "File $f is also reachable from the internet"
+            else
+                warn "File $f did not open from the internet — if it is healthy on the server, public DNS has not propagated yet; check from a phone or browser"
+            fi
+        done
+    else
+        echo "  Sub file: $WEB_ROOT/$SUB_FILE (not served on this server — put it on an HTTPS host yourself)"
+    fi
+}
+
+cmd_show() {
+    need_root
+    load_settings
+    if [[ "${SERVE_MODE:-caddy}" == "caddy" ]]; then
+        local url
+        url="$(sub_url)"
+        echo "Subscription link (enter it in the app):"
+        echo "  $url"
+    else
+        echo "Subscription file (put it on an HTTPS host yourself and enter that link in the app):"
+        echo "  $WEB_ROOT/$SUB_FILE"
+    fi
+    echo
+    echo "Direct import link (unbar://):"
+    if [[ -f "$LINK_FILE" ]]; then
+        echo "  $(cat "$LINK_FILE")"
+    else
+        warn "Link not built yet; run 'unbar-server regen'"
+    fi
+    echo
+    echo "Subscription JSON (the content served at the link):"
+    if [[ -f "$WEB_ROOT/$SUB_FILE" ]]; then
+        echo "  $(cat "$WEB_ROOT/$SUB_FILE")"
+    else
+        warn "Sub file not built yet; run 'unbar-server regen'"
+    fi
+    echo
+}
+
+cmd_regen() {
+    need_root
+    regen_sub
+    info "Done; the app gets the new version when the subscription is refreshed"
+}
+
+cmd_set() {
+    need_root
+    local key="$1" value="$2"
+    [[ -n "$key" && -n "$value" ]] || die "Usage: unbar-server set <name|zone|sub|email|file|https-port> <value>"
+    load_settings
+    case "$key" in
+        name)  set_setting NAME "$value" ;;
+        zone)
+            valid_domain "$value" || die "Invalid zone: $value"
+            set_setting ZONE "$value"
+            write_soar_unit
+            systemctl restart unbar-soar
+            warn "Zone changed; also create the new NS record in DNS"
+            ;;
+        sub)
+            valid_domain "$value" || die "Invalid subdomain: $value"
+            [[ "$value" != "$ZONE" ]] || die "The sub subdomain must not be the same as the zone"
+            case "$value" in
+                *".$ZONE") die "The sub subdomain must not be under the tunnel zone" ;;
+            esac
+            set_setting SUB_DOMAIN "$value"
+            if [[ "${SERVE_MODE:-caddy}" == "caddy" ]]; then
+                write_caddyfile
+                systemctl reload unbar-caddy 2>/dev/null || systemctl restart unbar-caddy
+            fi
+            warn "Subdomain changed; also create the new A record in DNS"
+            ;;
+        email)
+            set_setting EMAIL "$value"
+            if [[ "${SERVE_MODE:-caddy}" == "caddy" ]]; then
+                write_caddyfile
+                systemctl reload unbar-caddy 2>/dev/null || systemctl restart unbar-caddy
+            fi
+            ;;
+        https-port)
+            [[ "$value" =~ ^[0-9]+$ ]] && [[ "$value" -ge 1 && "$value" -le 65535 ]] || die "Invalid port: $value"
+            [[ "${SERVE_MODE:-caddy}" == "caddy" ]] || die "File mode is on; enable Caddy again with setup first"
+            if [[ "$value" != "$HTTPS_PORT" ]] && [[ -n "$(port_holders tcp "$value")" ]]; then
+                die "Port $value is held by $(port_holders tcp "$value" | tr '\n' ' '); pick another free port"
+            fi
+            set_setting HTTPS_PORT "$value"
+            write_caddyfile
+            systemctl reload unbar-caddy 2>/dev/null || systemctl restart unbar-caddy
+            warn "Also open the new port in the firewall and cloud console"
+            ;;
+        file)
+            valid_subfile "$value" || die "Invalid file name: $value"
+            local old_file="$SUB_FILE"
+            set_setting SUB_FILE "$value"
+            write_caddyfile
+            systemctl reload unbar-caddy 2>/dev/null || systemctl restart unbar-caddy
+            # Remove old files so two sub versions do not stay on the server
+            [[ "$old_file" != "$value" ]] && rm -f "$WEB_ROOT/$old_file" "$WEB_ROOT/$old_file.txt"
+            ;;
+        *) die "Unknown key: $key (name|zone|sub|email|file|https-port)" ;;
+    esac
+    regen_sub
+    info "Setting changed and the sub file is up to date"
+}
+
+cmd_rotate_key() {
+    need_root
+    load_settings
+    warn "A new key invalidates all previous configs (unbar:// and sub)"
+    ask_yes_no "Are you sure?" "n" || die "Cancelled"
+    generate_key
+    systemctl restart unbar-soar
+    regen_sub
+    info "Key changed; get the new link from 'unbar-server show'"
+}
+
+cmd_update() {
+    need_root
+    load_settings
+    local tag current
+    tag="$(latest_tag "$SOAR_REPO" "$SOAR_FALLBACK_TAG")"
+    current="$(installed_soar_tag)"
+    if [[ "$tag" == "$current" ]]; then
+        info "soar-server is already the latest version ($tag)"
+        return 0
+    fi
+    info "Updating soar-server: $current -> $tag"
+    install_go
+    install_soar "$tag"
+    systemctl restart unbar-soar
+    regen_sub
+    info "Updated"
+}
+
+cmd_logs() {
+    need_root
+    case "${1:-soar}" in
+        soar)  journalctl -u unbar-soar -n 100 --no-pager ;;
+        caddy) journalctl -u unbar-caddy -n 100 --no-pager ;;
+        *) die "Usage: unbar-server logs [soar|caddy]" ;;
+    esac
+}
+
+cmd_restart() {
+    need_root
+    load_settings
+    systemctl restart unbar-soar
+    if [[ "${SERVE_MODE:-caddy}" == "caddy" ]]; then
+        systemctl restart unbar-caddy
+    fi
+    info "Services restarted"
+}
+
+cmd_uninstall() {
+    need_root
+    warn "Everything will be removed: services, binaries, settings and the server key"
+    ask_yes_no "Are you sure?" "n" || die "Cancelled"
+    local backup="/root/unbar-server-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
+    if [[ -d "$ETC_DIR" ]]; then
+        tar -czf "$backup" -C / "$ETC_DIR" 2>/dev/null || true
+        info "Settings and key backed up to $backup"
+    fi
+    systemctl disable --now unbar-soar unbar-caddy 2>/dev/null || true
+    rm -f "$SOAR_UNIT" "$CADDY_UNIT"
+    rm -f "$BIN_DIR/unbar"
+    systemctl daemon-reload
+    rm -rf "$ETC_DIR" "$WEB_ROOT" "$BIN_DIR/soar-server"
+    info "Removed (Caddy and Go binaries are untouched; remove them by hand if you do not want them)"
+}
+
+# ---------- Interactive menu ----------
+# With no arguments (or `menu`) the script shows a numbered menu
+# instead of usage and stays in a loop until quit. Commands run in a
+# subshell so that if one fails (die), the menu does not close but returns.
+
+menu_pause() {
+    printf 'Press Enter to continue... ' >&2
+    read -r _ || true
+}
+
+# Run one menu command; then pause and return to the menu.
+menu_run() {
+    ( "$@" )
+    local rc=$?
+    echo
+    [[ $rc -eq 0 ]] || warn "Command failed (code $rc)"
+    menu_pause
+}
+
+cmd_menu_settings() {
+    if [[ ! -f "$SETTINGS_FILE" ]]; then
+        warn "Setup has not run yet; pick option 1 (Setup wizard) first"
+        menu_pause
+        return 0
+    fi
+    while true; do
+        load_settings
+        echo
+        echo "  Current settings:"
+        echo "    Name: $NAME | Zone: $ZONE | Subdomain: ${SUB_DOMAIN:-—} | Email: ${EMAIL:-—}"
+        echo "    File: $SUB_FILE | Mode: ${SERVE_MODE:-caddy} | HTTPS port: ${HTTPS_PORT:-443}"
+        echo
+        echo "  1) Display name (name)"
+        echo "  2) Tunnel zone (zone)"
+        echo "  3) Sub subdomain (sub)"
+        echo "  4) Let's Encrypt email (email)"
+        echo "  5) Subscription file name (file)"
+        echo "  6) HTTPS port (https-port)"
+        echo "  0) Back"
+        echo
+        printf 'Choice: ' >&2
+        local choice
+        if ! read -r choice; then
+            echo
+            return 0
+        fi
+        local key cur
+        case "$choice" in
+            1) key="name"; cur="$NAME" ;;
+            2) key="zone"; cur="$ZONE" ;;
+            3) key="sub"; cur="$SUB_DOMAIN" ;;
+            4) key="email"; cur="${EMAIL:-}" ;;
+            5) key="file"; cur="$SUB_FILE" ;;
+            6) key="https-port"; cur="${HTTPS_PORT:-443}" ;;
+            0) return 0 ;;
+            *) warn "Invalid choice: $choice"; continue ;;
+        esac
+        ask "New value for $key" "$cur"
+        menu_run cmd_set "$key" "$REPLY"
+    done
+}
+
+cmd_menu() {
+    need_root
+    trap 'echo; exit 0' INT
+    while true; do
+        echo
+        echo -e "${CYAN}===============================${NC}"
+        echo -e "${CYAN}  Unbar by Break The Barriers${NC}"
+        echo -e "${CYAN}===============================${NC}"
+        echo "  Soar server for Unbar"
+        echo
+        echo "  1) Setup wizard"
+        echo "  2) Service status"
+        echo "  3) Show links"
+        echo "  4) Regenerate sub file"
+        echo "  5) Settings"
+        echo "  6) New key"
+        echo "  7) Update soar-server"
+        echo "  8) Logs"
+        echo "  9) Restart services"
+        echo "  10) Uninstall"
+        echo "  0) Quit"
+        echo
+        printf 'Choice: ' >&2
+        local choice
+        if ! read -r choice; then
+            echo
+            exit 0
+        fi
+        case "$choice" in
+            1) menu_run cmd_setup ;;
+            2) menu_run cmd_status ;;
+            3) menu_run cmd_show ;;
+            4) menu_run cmd_regen ;;
+            5) cmd_menu_settings ;;
+            6) menu_run cmd_rotate_key ;;
+            7) menu_run cmd_update ;;
+            8)
+                ask "Logs of which service? (soar/caddy)" "soar"
+                case "$REPLY" in
+                    soar|caddy) menu_run cmd_logs "$REPLY" ;;
+                    *) warn "Invalid choice: $REPLY" ;;
+                esac
+                ;;
+            9) menu_run cmd_restart ;;
+            10)
+                if ( cmd_uninstall ); then
+                    echo
+                    info "Uninstalled; exiting the menu"
+                    exit 0
+                fi
+                menu_pause
+                ;;
+            0) exit 0 ;;
+            *) warn "Invalid choice: $choice" ;;
+        esac
+    done
+}
+
+usage() {
+    echo "unbar-server $VERSION — Set up a Soar tunnel server for Unbar"
+    echo
+    echo "  sudo unbar                         Interactive menu (same as: sudo unbar-server)"
+    echo "  sudo unbar-server setup            Interactive setup"
+    echo "  sudo unbar-server status           service and settings status"
+    echo "  sudo unbar-server show             Print the sub link, the unbar:// link, and the subscription JSON"
+    echo "  sudo unbar-server regen            Rebuild the sub file"
+    echo "  sudo unbar-server set <key> <value>   Change a setting (name|zone|sub|email|file|https-port)"
+    echo "  sudo unbar-server rotate-key       Generate a new key"
+    echo "  sudo unbar-server update           Update soar-server"
+    echo "  sudo unbar-server logs [soar|caddy]"
+    echo "  sudo unbar-server restart"
+    echo "  sudo unbar-server uninstall"
+}
+
+main() {
+    local cmd="${1:-}"
+    # bash 4+ is required (printf %q and a few other features)
+    [[ "${BASH_VERSINFO[0]:-0}" -ge 4 ]] || die "bash 4 or newer is required (current: $BASH_VERSION)"
+    case "$cmd" in
+        setup)      cmd_setup ;;
+        status)     cmd_status ;;
+        show)       cmd_show ;;
+        regen)      cmd_regen ;;
+        set)        shift; cmd_set "${1:-}" "${2:-}" ;;
+        rotate-key) cmd_rotate_key ;;
+        update)     cmd_update ;;
+        logs)       shift; cmd_logs "${1:-soar}" ;;
+        restart)    cmd_restart ;;
+        uninstall)  cmd_uninstall ;;
+        menu)       cmd_menu ;;
+        help|--help|-h) usage ;;
+        "")         cmd_menu ;;
+        *) error "Unknown command: $cmd"; usage; exit 1 ;;
+    esac
+}
+
+main "$@"
