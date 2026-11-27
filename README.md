@@ -158,6 +158,8 @@ sudo unbar
 `[...]` پیش‌فرض‌اند؛ Enter همان پیش‌فرض را می‌گیرد):
 
 1. **Tunnel zone** — زون تانل، بدون پیش‌فرض: `r.example.com`
+   (زون کوتاه‌تر مثل `t.ab.io` جای بیشتری برای داده در هر کوئری می‌گذارد
+   و کمی سریع‌تر است.)
 2. **Serve the sub file on this server with Caddy? [y]** — با `y`
    (Enter) فایل sub همین سرور با Caddy سرو می‌شود؛ با `n` فقط ذخیره
    می‌شود (حالت file).
@@ -559,6 +561,8 @@ Press `1`. Setup asks, in order (values in `[...]` are defaults; Enter
 takes the default):
 
 1. **Tunnel zone** — the tunnel zone, no default: `r.example.com`
+   (A shorter zone such as `t.ab.io` leaves more room for data in each
+   query and is slightly faster.)
 2. **Serve the sub file on this server with Caddy? [y]** — `y` (Enter)
    serves the sub file from this server with Caddy; `n` only saves it
    (file mode).

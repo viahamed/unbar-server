@@ -755,6 +755,7 @@ cmd_setup() {
     [[ -n "$https_port" ]] || https_port="443"
 
     # The zone has no default; it is asked fresh every time
+    echo "  Tip: a shorter zone (e.g. t.ab.io) leaves more room for data per query."
     ask "Tunnel zone (tunnel subdomain, e.g. r.example.com)" ""
     zone="$REPLY"
     valid_domain "$zone" || die "Invalid zone: $zone"
