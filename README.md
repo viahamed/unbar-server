@@ -141,7 +141,7 @@ sudo unbar
   4) Regenerate sub file
   5) Settings
   6) New key
-  7) Update soar-server
+  7) Update (script + server)
   8) Logs
   9) Restart services
   10) Uninstall
@@ -544,7 +544,7 @@ sudo unbar
   4) Regenerate sub file
   5) Settings
   6) New key
-  7) Update soar-server
+  7) Update (script + server)
   8) Logs
   9) Restart services
   10) Uninstall
