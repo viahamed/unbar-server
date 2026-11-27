@@ -18,6 +18,7 @@
 - [تداخل نداشتن با بقیهٔ سرویس‌ها](#no-interference-fa)
 - [خروجی‌ها](#outputs-fa)
 - [به‌روز شدن خودکار فایل sub](#auto-regen-fa)
+- [به‌روزرسانی](#update-fa)
 - [دستورها](#commands-fa)
 - [نکته‌ها](#notes-fa)
 - [لایسنس / License](#license)
@@ -211,7 +212,7 @@ sudo unbar
 | بازسازی فایل sub | 4 | `sudo unbar-server regen` |
 | تغییر یک تنظیم | 5 | `sudo unbar-server set <key> <value>` |
 | کلید جدید | 6 | `sudo unbar-server rotate-key` |
-| به‌روزرسانی soar-server | 7 | `sudo unbar-server update` |
+| به‌روزرسانی کامل (اسکریپت + سرور) | 7 | `sudo unbar-server update` |
 | لاگ | 8 | `sudo unbar-server logs [soar\|caddy]` |
 | ری‌استارت سرویس‌ها | 9 | `sudo unbar-server restart` |
 | حذف کامل | 10 | `sudo unbar-server uninstall` |
@@ -327,6 +328,36 @@ sub و میان‌بر `unbar`)؛ تنظیمات و کلید اول در
 sudo unbar-server regen
 ```
 
+## <a name="update-fa"></a>به‌روزرسانی
+
+از نسخهٔ 2 اسکریپت، فقط با گزینهٔ **7** منو (یا `sudo unbar-server update`)
+همهٔ تغییرات جدید روی سرور اعمال می‌شود:
+
+1. آخرین نسخهٔ خود اسکریپت از GitHub گرفته و جایگزین می‌شود.
+2. نسخهٔ جدید همه‌چیز را با تعریف خودش هماهنگ می‌کند: soar-server به آخرین
+   نسخه، تیونینگ سیستم، سرویس‌های systemd و فایل sub. فقط سرویسی که
+   واقعاً عوض شده ری‌استارت می‌شود.
+
+تنظیمات و کلید سرور دست نمی‌خورند و لینک‌ها عوض نمی‌شوند.
+
+**سرورهایی که با نسخهٔ 1 نصب شده‌اند** یک بار باید خط نصب را دوباره بزنند
+(تنظیمات و کلید حفظ می‌شوند)، بعد از منو گزینهٔ 7 را بزنند:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/viahamed/unbar-server/main/install.sh | sudo bash
+```
+
+از آن به بعد همان گزینهٔ 7 کافی است.
+
+**تیونینگ سیستم (از نسخهٔ 2):** بافرهای UDP کرنل بزرگ‌تر می‌شوند تا
+وقتی کوئری‌های زیادی هم‌زمان از ریزالورها می‌رسند، کرنل بی‌صدا دورشان
+نریزد (کاربر این را به‌شکل افت سرعت می‌بیند). تنظیمات در فایل جداگانهٔ
+`/etc/sysctl.d/99-unbar-server.conf` نوشته می‌شوند و بعد از ری‌بوت هم
+می‌مانند؛ اگر کرنل BBR داشته باشد، BBR هم برای مسیر سرور تا سایت‌ها فعال
+می‌شود. سقف فایل‌های باز سرویس soar هم بالا می‌رود. روی بعضی VPSهای
+کانتینری (OpenVZ/LXC) بعضی از این کلیدها مجاز نیستند؛ اسکریپت فقط هشدار
+می‌دهد و ادامه می‌دهد. با `uninstall` این فایل هم حذف می‌شود.
+
 ## <a name="commands-fa"></a>دستورها
 
 همهٔ دستورها با `unbar` و `unbar-server` هر دو کار می‌کنند:
@@ -344,7 +375,7 @@ sudo unbar-server set email admin@example.com  # تغییر ایمیل Let's Enc
 sudo unbar-server set file subscription        # تغییر نام فایل سابسکریپشن
 sudo unbar-server set https-port 8443         # تغییر پورت HTTPS سرو فایل sub (فقط حالت Caddy)
 sudo unbar-server rotate-key                   # کلید جدید (کانفیگ‌های قبلی باطل می‌شوند!)
-sudo unbar-server update                       # به‌روزرسانی soar-server به آخرین نسخه
+sudo unbar-server update                       # به‌روزرسانی کامل: اسکریپت، soar-server، تیونینگ و سرویس‌ها
 sudo unbar-server logs [soar|caddy]            # لاگ (پیش‌فرض soar)
 sudo unbar-server restart
 sudo unbar-server uninstall                    # حذف کامل (پشتیبان در /root ذخیره می‌شود)
@@ -389,6 +420,7 @@ Repo: https://github.com/viahamed/unbar-server
 - [No interference with other services](#no-interference)
 - [Outputs](#outputs)
 - [Automatic sub-file regeneration](#auto-regen)
+- [Updating](#update)
 - [Commands](#commands)
 - [Notes](#notes)
 - [License](#license)
@@ -581,7 +613,7 @@ All of these work from the menu and as direct commands:
 | Rebuild the sub file | 4 | `sudo unbar-server regen` |
 | Change a setting | 5 | `sudo unbar-server set <key> <value>` |
 | New key | 6 | `sudo unbar-server rotate-key` |
-| Update soar-server | 7 | `sudo unbar-server update` |
+| Full update (script + server) | 7 | `sudo unbar-server update` |
 | Logs | 8 | `sudo unbar-server logs [soar\|caddy]` |
 | Restart services | 9 | `sudo unbar-server restart` |
 | Complete removal | 10 | `sudo unbar-server uninstall` |
@@ -700,6 +732,36 @@ subscription refresh. If you changed the settings by hand:
 sudo unbar-server regen
 ```
 
+## <a name="update"></a>Updating
+
+From script version 2, option **7** in the menu (or `sudo unbar-server update`)
+applies every new change to the server:
+
+1. The newest version of this script is fetched from GitHub and replaces the old one.
+2. The new version brings everything in line with what it defines: soar-server
+   at its latest version, system tuning, the systemd services and the sub file.
+   Only a service that actually changed is restarted.
+
+Settings and the server key are not touched, and the links stay the same.
+
+**Servers installed with version 1** need to run the install line once more
+(settings and key are kept), then option 7 from the menu:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/viahamed/unbar-server/main/install.sh | sudo bash
+```
+
+After that, option 7 is all you need.
+
+**System tuning (from version 2):** the kernel's UDP buffers are enlarged so
+that bursts of queries arriving from many resolvers at once are not silently
+dropped by the kernel (users would see that as lower speed). The settings go
+in their own file, `/etc/sysctl.d/99-unbar-server.conf`, and survive reboots;
+if the kernel has BBR, BBR is also enabled for the server-to-website leg. The
+soar service's open-file limit is raised too. Some container VPSes
+(OpenVZ/LXC) do not allow some of these keys; the script only warns and
+carries on. `uninstall` removes this file as well.
+
 ## <a name="commands"></a>Commands
 
 All commands work with both `unbar` and `unbar-server`:
@@ -717,7 +779,7 @@ sudo unbar-server set email admin@example.com  # change the Let's Encrypt email
 sudo unbar-server set file subscription        # change the subscription file name
 sudo unbar-server set https-port 8443         # change the HTTPS port serving the sub file (Caddy mode only)
 sudo unbar-server rotate-key                   # new key (previous configs are invalidated!)
-sudo unbar-server update                       # update soar-server to the latest version
+sudo unbar-server update                       # full update: script, soar-server, tuning and services
 sudo unbar-server logs [soar|caddy]            # logs (default soar)
 sudo unbar-server restart
 sudo unbar-server uninstall                    # complete removal (backup saved in /root)

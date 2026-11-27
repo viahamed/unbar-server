@@ -32,7 +32,7 @@
 #   sudo unbar-server regen            # rebuild the sub file from settings
 #   sudo unbar-server set name ...     # change one setting (name|zone|sub|email|file|https-port)
 #   sudo unbar-server rotate-key       # generate a new key (old configs are invalidated)
-#   sudo unbar-server update           # update soar-server to the latest version
+#   sudo unbar-server update           # update everything: this script, soar-server, system tuning, services
 #   sudo unbar-server logs [soar|caddy]
 #   sudo unbar-server restart
 #   sudo unbar-server uninstall
@@ -47,7 +47,9 @@
 set -euo pipefail
 
 SCRIPT_NAME="unbar-server"
-VERSION="1"
+VERSION="2"
+SELF_URL="https://raw.githubusercontent.com/viahamed/unbar-server/main/unbar-server"
+SYSCTL_FILE="/etc/sysctl.d/99-unbar-server.conf"
 
 ETC_DIR="/etc/unbar-server"
 SETTINGS_FILE="$ETC_DIR/settings"
@@ -282,6 +284,54 @@ install_soar() {
     info "soar-server installed: $($BIN_DIR/soar-server 2>&1 | head -1 || true)"
 }
 
+
+# ---------- System tuning (UDP buffers) ----------
+# A DNS tunnel server receives bursts of UDP queries from many resolvers at
+# once. With Linux's default socket buffers (~208 KB) those bursts overflow
+# and the kernel drops queries silently, which the client sees as loss.
+# soar-server does not size its own socket buffer, so rmem_default /
+# wmem_default are what its UDP socket actually gets.
+# Written to its own file in /etc/sysctl.d, so it survives reboots and
+# touches no other config. Each key is applied on its own: some VPS types
+# (OpenVZ/LXC containers) do not allow some keys; those are only warned about.
+apply_system_tuning() {
+    cat > "$SYSCTL_FILE" <<'EOF'
+# Written by unbar-server (rewritten on every update). Remove with: unbar-server uninstall
+# UDP buffers for bursts of DNS queries
+net.core.rmem_max = 33554432
+net.core.wmem_max = 33554432
+net.core.rmem_default = 8388608
+net.core.wmem_default = 8388608
+net.core.netdev_max_backlog = 16384
+net.ipv4.udp_rmem_min = 16384
+net.ipv4.udp_wmem_min = 16384
+EOF
+    # BBR + fq only helps the server -> website leg; added only if the kernel has it
+    modprobe tcp_bbr 2>/dev/null || true
+    if grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+        printf '%s\n' "# Server -> website TCP" "net.core.default_qdisc = fq" "net.ipv4.tcp_congestion_control = bbr" >> "$SYSCTL_FILE"
+    fi
+    chmod 644 "$SYSCTL_FILE"
+    local line key val failed=0
+    while IFS= read -r line; do
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        key="${line%%=*}"; key="${key// /}"
+        val="${line#*=}"; val="${val# }"
+        sysctl -q -w "$key=$val" >/dev/null 2>&1 || { failed=1; warn "  not allowed on this server: $key"; }
+    done < "$SYSCTL_FILE"
+    if [[ $failed -eq 0 ]]; then
+        info "System tuning applied (UDP buffers)"
+    else
+        warn "System tuning applied partly (normal on container VPSes)"
+    fi
+}
+
+remove_system_tuning() {
+    [[ -f "$SYSCTL_FILE" ]] || return 0
+    rm -f "$SYSCTL_FILE"
+    sysctl --system >/dev/null 2>&1 || true
+}
+
 # ---------- Caddy ----------
 
 CADDY_FALLBACK_TAG="v2.11.9"  # version tested on the server; if the GitHub API is unavailable
@@ -466,6 +516,7 @@ Group=$svc_user
 ExecStart=$BIN_DIR/soar-server -zone $ZONE -key-file $KEY_FILE -listen :53
 Restart=on-failure
 RestartSec=5
+LimitNOFILE=1048576
 NoNewPrivileges=true
 PrivateTmp=true
 $caps
@@ -804,7 +855,9 @@ cmd_setup() {
     install_soar "$tag"
     ensure_users
     [[ -f "$KEY_FILE" ]] || generate_key
+    apply_system_tuning
     write_soar_unit
+    set_setting SCRIPT_VERSION "$VERSION"
     if [[ "$serve_mode" == "caddy" ]]; then
         install_caddy
         write_caddyfile
@@ -1004,22 +1057,84 @@ cmd_rotate_key() {
     info "Key changed; get the new link from 'unbar-server show'"
 }
 
+# update = bring this server fully up to date with ONE command:
+#   1. fetch the newest unbar-server script from GitHub and switch to it
+#   2. run the new script's reconcile step, which re-applies everything the
+#      current version defines (soar-server version, system tuning, systemd
+#      units, sub file) and restarts only what changed.
+# Rule for future changes: anything a new version adds must be added to
+# reconcile() in an idempotent way (safe to run any number of times), so a
+# plain "update" applies it to servers set up with any older version.
+self_update() {  # 0 = a newer script was installed, 1 = already the latest / unavailable
+    local tmp self
+    self="$BIN_DIR/$SCRIPT_NAME"
+    tmp="$(mktemp)"
+    if ! curl -fsSL "$SELF_URL" -o "$tmp" 2>/dev/null; then
+        rm -f "$tmp"; warn "Could not download the latest script from GitHub; continuing with this one"; return 1
+    fi
+    if ! head -n 1 "$tmp" | grep -q '^#!/usr/bin/env bash' || ! bash -n "$tmp" 2>/dev/null; then
+        rm -f "$tmp"; warn "The downloaded script is not valid; continuing with this one"; return 1
+    fi
+    if [[ -f "$self" ]] && cmp -s "$tmp" "$self"; then
+        rm -f "$tmp"; info "unbar-server script is already the latest (v$VERSION)"; return 1
+    fi
+    chmod 755 "$tmp"
+    # mv replaces the file atomically (new inode), so a running copy is not disturbed
+    mv -f "$tmp" "$self"
+    ln -sf "$self" "$BIN_DIR/unbar"
+    info "unbar-server script updated"
+    return 0
+}
+
+reconcile() {
+    load_settings
+    local before after restart_soar=0 tag current
+    # 1) soar-server
+    tag="$(latest_tag "$SOAR_REPO" "$SOAR_FALLBACK_TAG")"
+    current="$(installed_soar_tag)"
+    if [[ "$tag" != "$current" || ! -x "$BIN_DIR/soar-server" ]]; then
+        info "Updating soar-server: ${current:-none} -> $tag"
+        install_go
+        install_soar "$tag"
+        restart_soar=1
+    else
+        info "soar-server is already the latest version ($tag)"
+    fi
+    # 2) system tuning
+    apply_system_tuning
+    # 3) systemd units (restart only if the unit changed)
+    ensure_users
+    before="$(cat "$SOAR_UNIT" 2>/dev/null | md5sum)"
+    write_soar_unit
+    after="$(md5sum < "$SOAR_UNIT")"
+    [[ "$before" == "$after" ]] || restart_soar=1
+    if [[ "$SERVE_MODE" == "caddy" ]]; then
+        before="$(cat "$CADDY_UNIT" "$CADDYFILE" 2>/dev/null | md5sum)"
+        write_caddyfile
+        write_caddy_unit
+        after="$(cat "$CADDY_UNIT" "$CADDYFILE" 2>/dev/null | md5sum)"
+        if [[ "$before" != "$after" ]]; then
+            systemctl restart unbar-caddy || warn "Restarting caddy failed — check with 'unbar-server logs caddy'"
+        fi
+    fi
+    if [[ $restart_soar -eq 1 ]]; then
+        systemctl restart unbar-soar || warn "Restarting soar failed — check with 'unbar-server logs soar'"
+        info "soar restarted"
+    fi
+    # 4) sub file
+    regen_sub
+    set_setting SCRIPT_VERSION "$VERSION"
+    info "Server is up to date (unbar-server v$VERSION, soar-server $tag)"
+}
+
 cmd_update() {
     need_root
     load_settings
-    local tag current
-    tag="$(latest_tag "$SOAR_REPO" "$SOAR_FALLBACK_TAG")"
-    current="$(installed_soar_tag)"
-    if [[ "$tag" == "$current" ]]; then
-        info "soar-server is already the latest version ($tag)"
-        return 0
+    if [[ "${1:-}" != "--no-self-update" ]] && self_update; then
+        # Continue with the NEW script, so its reconcile step runs
+        exec "$BIN_DIR/$SCRIPT_NAME" update --no-self-update
     fi
-    info "Updating soar-server: $current -> $tag"
-    install_go
-    install_soar "$tag"
-    systemctl restart unbar-soar
-    regen_sub
-    info "Updated"
+    reconcile
 }
 
 cmd_logs() {
@@ -1055,6 +1170,7 @@ cmd_uninstall() {
     rm -f "$BIN_DIR/unbar"
     systemctl daemon-reload
     rm -rf "$ETC_DIR" "$WEB_ROOT" "$BIN_DIR/soar-server"
+    remove_system_tuning
     info "Removed (Caddy and Go binaries are untouched; remove them by hand if you do not want them)"
 }
 
@@ -1136,7 +1252,7 @@ cmd_menu() {
         echo "  4) Regenerate sub file"
         echo "  5) Settings"
         echo "  6) New key"
-        echo "  7) Update soar-server"
+        echo "  7) Update (script + server)"
         echo "  8) Logs"
         echo "  9) Restart services"
         echo "  10) Uninstall"
@@ -1155,7 +1271,12 @@ cmd_menu() {
             4) menu_run cmd_regen ;;
             5) cmd_menu_settings ;;
             6) menu_run cmd_rotate_key ;;
-            7) menu_run cmd_update ;;
+            7)
+                # Run as a new process, then reopen the menu from the (possibly new) script
+                "$BIN_DIR/$SCRIPT_NAME" update || warn "Update failed"
+                menu_pause
+                exec "$BIN_DIR/$SCRIPT_NAME" menu
+                ;;
             8)
                 ask "Logs of which service? (soar/caddy)" "soar"
                 case "$REPLY" in
@@ -1188,7 +1309,7 @@ usage() {
     echo "  sudo unbar-server regen            Rebuild the sub file"
     echo "  sudo unbar-server set <key> <value>   Change a setting (name|zone|sub|email|file|https-port)"
     echo "  sudo unbar-server rotate-key       Generate a new key"
-    echo "  sudo unbar-server update           Update soar-server"
+    echo "  sudo unbar-server update           Update everything (script, soar-server, tuning, services)"
     echo "  sudo unbar-server logs [soar|caddy]"
     echo "  sudo unbar-server restart"
     echo "  sudo unbar-server uninstall"
@@ -1205,7 +1326,7 @@ main() {
         regen)      cmd_regen ;;
         set)        shift; cmd_set "${1:-}" "${2:-}" ;;
         rotate-key) cmd_rotate_key ;;
-        update)     cmd_update ;;
+        update)     shift; cmd_update "${1:-}" ;;
         logs)       shift; cmd_logs "${1:-soar}" ;;
         restart)    cmd_restart ;;
         uninstall)  cmd_uninstall ;;
