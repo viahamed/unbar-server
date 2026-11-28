@@ -69,7 +69,10 @@ Caddy).
 1. خودش را در `/usr/local/bin/unbar-server` نصب می‌کند و میان‌بر `unbar`
    را می‌سازد
 2. بررسی root و systemd و آزاد بودن پورت 53؛ اگر stub مربوط به
-   systemd-resolved آن را گرفته باشد، با تأیید تو خاموشش می‌کند.
+   systemd-resolved آن را گرفته باشد، با تأیید تو خاموشش می‌کند
+   (فایل `/etc/systemd/resolved.conf.d/unbar-dns.conf` با DNSهای عمومی 8.8.8.8 و 1.1.1.1، و
+   `/etc/resolv.conf` یک بار پشتیبان‌گیری می‌شود و به `/run/systemd/resolve/resolv.conf` اشاره می‌کند
+   تا DNS خود سرور کار کند؛ `uninstall` همه را برمی‌گرداند).
    هر DNS دیگری که 53 را گرفته باشد دست نمی‌خورد — setup همان‌جا
    می‌ایستد و اسمش را می‌گوید
 3. نصب ابزارهای لازم (curl ،tar) و نصب Go از go.dev (اگر نسخهٔ 1.25+
@@ -378,10 +381,33 @@ sudo unbar-server set file subscription        # تغییر نام فایل سا
 sudo unbar-server set https-port 8443         # تغییر پورت HTTPS سرو فایل sub (فقط حالت Caddy)
 sudo unbar-server rotate-key                   # کلید جدید (کانفیگ‌های قبلی باطل می‌شوند!)
 sudo unbar-server update                       # به‌روزرسانی کامل: اسکریپت، soar-server، تیونینگ و سرویس‌ها
-sudo unbar-server logs [soar|caddy]            # لاگ (پیش‌فرض soar)
+sudo unbar-server logs [N]                     # N خط آخر لاگ هر دو سرویس (پیش‌فرض 20)
+sudo unbar-server logs [soar|caddy] [N]        # لاگ یک سرویس (پیش‌فرض 100 خط)
 sudo unbar-server restart
 sudo unbar-server uninstall                    # حذف کامل (پشتیبان در /root ذخیره می‌شود)
 sudo unbar-server help                         # راهنما
+```
+
+### <a name="subcommands-fa"></a>دستورهای غیرتعاملی (برای اتوماسیون و بات)
+
+این دستورها هیچ سؤالی نمی‌پرسند و اگر کاری انجام نشود با کد خروج غیرصفر
+تمام می‌شوند. منوی تعاملی و رفتار بدون آرگومان دست نخورده است.
+[بات تلگرام Unbar-Server](https://t.me/UnbarServerBot) هم برای «مدیریت سرور» از همین‌ها استفاده می‌کند.
+
+```
+sudo unbar-server status --json        # یک JSON: فعال بودن سرویس‌ها، نسخهٔ اسکریپت و soar-server، زون، ساب‌دامنه، پورت HTTPS، حالت سرو، نام فایل sub، نام
+sudo unbar-server links                # فقط لینک sub و لینک unbar:// (همان قالب show)
+sudo unbar-server regen-sub            # همان regen
+sudo unbar-server set https-port 8443  # بررسی آزاد بودن پورت (53 و 80 ممنوع)، باز کردن فایروال، بازسازی sub
+sudo unbar-server set name "نام جدید"  # یک خط، حداکثر 64 نویسه
+sudo unbar-server set zone t2.example.com  # ساب‌دامنهٔ sub نباید با زون یکی یا زیر آن باشد؛ ns.<والد> هم به‌روز می‌شود و رکوردهای NS/A لازم چاپ می‌شوند
+sudo unbar-server set sub sub2.example.com # نباید با زون یکی یا زیر آن باشد؛ Caddy گواهی دامنهٔ تازه را خودکار می‌گیرد
+sudo unbar-server set file feed        # در حالت فایل به Caddy دست نمی‌زند؛ فایل‌های قدیمی پاک می‌شوند
+sudo unbar-server update               # همان گزینهٔ 7 منو؛ اگر بعدش سرویسی فعال نباشد کد خروج غیرصفر
+sudo unbar-server restart
+sudo unbar-server logs 20              # 20 خط آخر لاگ unbar-soar و unbar-caddy
+sudo unbar-server uninstall --yes      # حذف کامل بدون پرسیدن تأیید
+unbar-server version                   # «unbar-server <نسخه> (api <n>)»
 ```
 
 ## <a name="notes-fa"></a>نکته‌ها
@@ -473,7 +499,10 @@ What the script does itself:
 1. Installs itself at `/usr/local/bin/unbar-server` and creates the `unbar`
    shortcut
 2. Checks root and systemd and that port 53 is free; if the systemd-resolved
-   stub holds it, it disables it with your confirmation. Any other DNS
+   stub holds it, it disables it with your confirmation (it writes
+   `/etc/systemd/resolved.conf.d/unbar-dns.conf` with public DNS 8.8.8.8 and 1.1.1.1, backs up
+   `/etc/resolv.conf` once and points it to `/run/systemd/resolve/resolv.conf` so the server itself
+   keeps resolving; `uninstall` restores all of it). Any other DNS
    holding port 53 is left untouched — setup stops there and tells you its name
 3. Installs the required tools (curl, tar) and Go from go.dev (if version
    1.25+ is not present)
@@ -784,10 +813,33 @@ sudo unbar-server set file subscription        # change the subscription file na
 sudo unbar-server set https-port 8443         # change the HTTPS port serving the sub file (Caddy mode only)
 sudo unbar-server rotate-key                   # new key (previous configs are invalidated!)
 sudo unbar-server update                       # full update: script, soar-server, tuning and services
-sudo unbar-server logs [soar|caddy]            # logs (default soar)
+sudo unbar-server logs [N]                     # last N log lines of both services (default 20)
+sudo unbar-server logs [soar|caddy] [N]        # one service's logs (default 100 lines)
 sudo unbar-server restart
 sudo unbar-server uninstall                    # complete removal (backup saved in /root)
 sudo unbar-server help                         # help
+```
+
+### <a name="subcommands"></a>Non-interactive subcommands (for automation and the bot)
+
+These never prompt and exit non-zero when they fail. The interactive menu
+and the no-argument behaviour are unchanged. The
+[Unbar-Server Telegram bot](https://t.me/UnbarServerBot) uses them for "Manage server".
+
+```
+sudo unbar-server status --json        # one JSON object: services active?, script and soar-server versions, zone, subdomain, HTTPS port, serve mode, sub file name, name
+sudo unbar-server links                # only the sub link and the unbar:// link (same layout as show)
+sudo unbar-server regen-sub            # same as regen
+sudo unbar-server set https-port 8443  # checks the port is free (53 and 80 refused), opens the firewall, rebuilds the sub
+sudo unbar-server set name "new name"  # one line, at most 64 characters
+sudo unbar-server set zone t2.example.com  # the sub subdomain must not equal or be under it; also updates ns.<parent> and prints the NS/A records needed
+sudo unbar-server set sub sub2.example.com # must not equal or be under the zone; Caddy fetches the new domain's certificate itself
+sudo unbar-server set file feed        # leaves Caddy alone in file mode; old files are removed
+sudo unbar-server update               # same as menu 7; non-zero exit if a service is down afterwards
+sudo unbar-server restart
+sudo unbar-server logs 20              # last 20 lines of unbar-soar and unbar-caddy
+sudo unbar-server uninstall --yes      # complete removal without the confirmation prompt
+unbar-server version                   # "unbar-server <version> (api <n>)"
 ```
 
 ## <a name="notes"></a>Notes

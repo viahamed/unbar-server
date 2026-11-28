@@ -33,9 +33,22 @@
 #   sudo unbar-server set name ...     # change one setting (name|zone|sub|email|file|https-port)
 #   sudo unbar-server rotate-key       # generate a new key (old configs are invalidated)
 #   sudo unbar-server update           # update everything: this script, soar-server, system tuning, services
-#   sudo unbar-server logs [soar|caddy]
+#   sudo unbar-server logs [N]         # last N lines (default 20) of both unbar services
+#   sudo unbar-server logs [soar|caddy] [N]
 #   sudo unbar-server restart
-#   sudo unbar-server uninstall
+#   sudo unbar-server uninstall [--yes]
+#
+# Non-interactive subcommands (for automation, e.g. the Telegram bot; none of
+# them prompts, and each exits non-zero on failure):
+#   sudo unbar-server status --json    # one JSON object: services, versions, settings
+#   sudo unbar-server links            # sub link + unbar:// link (same format as `show`)
+#   sudo unbar-server regen-sub        # same as regen
+#   sudo unbar-server set https-port N # validated: free port, not 53/80; opens the firewall
+#   sudo unbar-server set name "X"
+#   sudo unbar-server set zone|sub|file X  # validated as in setup; then `links` for the new links
+#   sudo unbar-server update           # same as menu 7
+#   sudo unbar-server uninstall --yes  # no confirmation prompt
+#   unbar-server version               # "unbar-server <version> (api <n>)"
 #
 # Prerequisites: Linux with systemd, root access, and two DNS records that
 # must exist before setup (setup shows them again at the end):
@@ -47,7 +60,10 @@
 set -euo pipefail
 
 SCRIPT_NAME="unbar-server"
-VERSION="2"
+VERSION="3"
+# Version of the non-interactive subcommand interface (status --json, links,
+# regen-sub, logs N, uninstall --yes, version). Bumped only when it changes.
+SCRIPT_API="1"
 SELF_URL="https://raw.githubusercontent.com/viahamed/unbar-server/main/unbar-server"
 SYSCTL_FILE="/etc/sysctl.d/99-unbar-server.conf"
 
@@ -61,6 +77,14 @@ CADDYFILE="$ETC_DIR/Caddyfile"
 SOAR_UNIT="/etc/systemd/system/unbar-soar.service"
 CADDY_UNIT="/etc/systemd/system/unbar-caddy.service"
 BIN_DIR="/usr/local/bin"
+BACKUP_DIR="/root"
+
+# Server DNS (only touched when systemd-resolved's stub held port 53, or DNS was broken)
+RESOLVED_DROPIN="/etc/systemd/resolved.conf.d/unbar-dns.conf"
+RESOLV_CONF="/etc/resolv.conf"
+RESOLV_BAK="/etc/resolv.conf.unbar-bak"
+RESOLVED_UPSTREAM="/run/systemd/resolve/resolv.conf"   # real upstream servers (no stub)
+RESOLVED_STUB_RESOLV="/run/systemd/resolve/stub-resolv.conf"
 
 SOAR_REPO="getlantern/soar"
 CADDY_REPO="caddyserver/caddy"
@@ -178,6 +202,26 @@ valid_domain() {  # a simple valid domain (lowercase, dots, hyphens)
 
 valid_subfile() {  # subscription file name: letters/digits/dot/hyphen/underscore, no slash
     [[ "$1" =~ ^[a-zA-Z0-9._-]+$ ]] && [[ "$1" != "." && "$1" != ".." ]]
+}
+
+valid_name() {  # display name: not empty, one line, no control characters, at most 64 characters
+    [[ -n "$1" ]] && [[ "${#1}" -le 64 ]] && [[ "$1" != *[[:cntrl:]]* ]]
+}
+
+# Ports the sub file must never use: 53 is the DNS tunnel, 80 is the ACME (Let's Encrypt) challenge
+valid_https_port() {
+    [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 && "$1" -le 65535 ]] && [[ "$1" != "53" && "$1" != "80" ]]
+}
+
+json_str() {  # json_str "text" -> a JSON string literal (no python needed)
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\t'/\\t}"
+    s="$(printf '%s' "$s" | tr -d '\000-\010\013\014\016-\037\177')"
+    printf '"%s"' "$s"
 }
 
 # ---------- Install prerequisites ----------
@@ -600,20 +644,111 @@ port_holders() {  # port_holders udp|tcp 53
     fi
 }
 
+# ---------- Server DNS (systemd-resolved) ----------
+# With the stub listener off, 127.0.0.53 answers nothing, so /etc/resolv.conf
+# must not point at it. Every function here is idempotent: running setup or
+# update again leaves the same files.
+
+dns_works() {  # can this server resolve and reach the internet?
+    getent hosts github.com >/dev/null 2>&1 \
+        || curl -fsSL --max-time 8 https://go.dev -o /dev/null 2>/dev/null
+}
+
+resolved_active() { systemctl is-active --quiet systemd-resolved 2>/dev/null; }
+
+# Drop-in: public upstream servers and no stub listener (the tunnel needs port 53).
+# Returns 0 if the file was (re)written, 1 if it already had this content.
+write_resolved_dropin() {
+    local want
+    want="$(printf '[Resolve]\nDNS=8.8.8.8 1.1.1.1\nFallbackDNS=8.8.4.4 1.0.0.1\nDNSStubListener=no')"
+    if [[ -f "$RESOLVED_DROPIN" ]] && [[ "$(cat "$RESOLVED_DROPIN")" == "$want" ]]; then
+        return 1
+    fi
+    mkdir -p "$(dirname "$RESOLVED_DROPIN")"
+    printf '%s\n' "$want" > "$RESOLVED_DROPIN"
+    chmod 644 "$RESOLVED_DROPIN"
+    return 0
+}
+
+backup_resolv_conf() {  # once: an existing backup is never overwritten
+    [[ -e "$RESOLV_BAK" || -L "$RESOLV_BAK" ]] && return 0
+    [[ -e "$RESOLV_CONF" || -L "$RESOLV_CONF" ]] || return 0
+    cp -P "$RESOLV_CONF" "$RESOLV_BAK"
+    info "Backed up $RESOLV_CONF to $RESOLV_BAK"
+}
+
+resolv_uses_stub() {  # /etc/resolv.conf -> stub-resolv.conf, or a nameserver 127.0.0.53 line
+    if [[ -L "$RESOLV_CONF" ]] && [[ "$(readlink "$RESOLV_CONF")" == *stub-resolv.conf ]]; then
+        return 0
+    fi
+    grep -qE '^[[:space:]]*nameserver[[:space:]]+127\.0\.0\.53([[:space:]]|$)' "$RESOLV_CONF" 2>/dev/null
+}
+
+# Point /etc/resolv.conf at resolved's real upstream list. Returns 0 if it changed.
+point_resolv_to_upstream() {
+    resolv_uses_stub || return 1
+    backup_resolv_conf
+    ln -sf "$RESOLVED_UPSTREAM" "$RESOLV_CONF"
+    info "$RESOLV_CONF now points to $RESOLVED_UPSTREAM (the stub is off)"
+    return 0
+}
+
+# Used by free_port_53 and reconcile: drop-in + resolv.conf, restart resolved only on change.
+apply_resolved_config() {
+    local changed=0
+    write_resolved_dropin && changed=1
+    point_resolv_to_upstream && changed=1
+    if [[ $changed -eq 1 ]]; then
+        systemctl restart systemd-resolved 2>/dev/null || true
+        sleep 2
+    fi
+    return 0
+}
+
 # Can the server still resolve domain names? (after disabling the resolved stub)
 check_server_dns() {
-    if curl -fsSL --max-time 8 https://go.dev -o /dev/null 2>/dev/null; then
+    if dns_works; then
         info "Server DNS is healthy"
         return 0
     fi
-    warn "Server DNS does not work after disabling the stub; adding a public resolver"
-    cp /etc/resolv.conf /etc/resolv.conf.unbar-bak 2>/dev/null || true
-    printf 'nameserver 1.1.1.1\n' >> /etc/resolv.conf 2>/dev/null || true
-    if curl -fsSL --max-time 8 https://go.dev -o /dev/null 2>/dev/null; then
-        info "DNS fixed with 1.1.1.1 (backup: /etc/resolv.conf.unbar-bak)"
+    if resolved_active; then
+        warn "Server DNS does not work; setting public DNS servers in systemd-resolved"
+        apply_resolved_config
+    else
+        # No resolved: a regular file (never write through a symlink into /run)
+        warn "Server DNS does not work; writing public nameservers to $RESOLV_CONF"
+        backup_resolv_conf
+        rm -f "$RESOLV_CONF"
+        printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' > "$RESOLV_CONF"
+        chmod 644 "$RESOLV_CONF"
+    fi
+    if dns_works; then
+        info "DNS fixed with public resolvers (backup: $RESOLV_BAK)"
         return 0
     fi
-    die "Server DNS does not work; check /etc/resolv.conf (it must have a valid nameserver)"
+    die "Server DNS does not work; check $RESOLV_CONF (it must have a valid nameserver)"
+}
+
+# Uninstall: undo the above. Only acts if unbar changed something.
+restore_server_dns() {
+    local had_dropin=0
+    [[ -f "$RESOLVED_DROPIN" ]] && had_dropin=1
+    if [[ $had_dropin -eq 0 ]] && [[ ! -e "$RESOLV_BAK" && ! -L "$RESOLV_BAK" ]]; then
+        return 0
+    fi
+    rm -f "$RESOLVED_DROPIN"
+    if [[ -e "$RESOLV_BAK" || -L "$RESOLV_BAK" ]]; then
+        rm -f "$RESOLV_CONF"
+        mv -f "$RESOLV_BAK" "$RESOLV_CONF"
+        info "Restored $RESOLV_CONF from the backup"
+    elif [[ $had_dropin -eq 1 ]] && resolved_active; then
+        ln -sf "$RESOLVED_STUB_RESOLV" "$RESOLV_CONF"
+        info "$RESOLV_CONF points to the systemd-resolved stub again"
+    fi
+    if resolved_active; then
+        systemctl restart systemd-resolved 2>/dev/null || true
+    fi
+    return 0
 }
 
 # Check port 53; the usual catch: the systemd-resolved stub listener on 127.0.0.53
@@ -631,7 +766,8 @@ free_port_53() {
         info "Port 53 is held by the current soar-server; it will be replaced at the end of setup"
         return 0
     fi
-    while read -r holder; do
+    # holders come in on fd 3 so stdin stays free for the ask_yes_no answer
+    while read -r holder <&3; do
         [[ -z "$holder" ]] && continue
         [[ "$holder" == "soar-server" ]] && continue
         case "$holder" in
@@ -640,8 +776,10 @@ free_port_53() {
                 # both are disabled with DNSStubListener=no
                 warn "Port 53 is held by systemd-resolved (stub)"
                 if ask_yes_no "Disable the stub listener so soar-server can listen on 53?" "y"; then
-                    mkdir -p /etc/systemd/resolved.conf.d
-                    printf '[Resolve]\nDNSStubListener=no\n' > /etc/systemd/resolved.conf.d/unbar-dns.conf
+                    # Drop-in with public DNS + DNSStubListener=no, and /etc/resolv.conf
+                    # moved off 127.0.0.53 (backed up once) so the server keeps resolving
+                    write_resolved_dropin || true
+                    point_resolv_to_upstream || true
                     systemctl restart systemd-resolved 2>/dev/null || true
                     sleep 2
                     if port_holders udp 53 | grep -q "systemd-resolve"; then
@@ -657,7 +795,7 @@ free_port_53() {
                 die "Port 53 is held by $holder; the Soar tunnel needs this port — stop the $holder service manually or set the tunnel up on another server"
                 ;;
         esac
-    done <<< "$holders"
+    done 3<<< "$holders"
 }
 
 open_firewall() {  # open_firewall caddy|file [https-port]
@@ -981,6 +1119,52 @@ cmd_show() {
     echo
 }
 
+# status --json: one JSON object on stdout, no network checks, never prompts.
+# Before setup it prints {"installed":false,...} and exits 0.
+cmd_status_json() {
+    need_root
+    if [[ ! -f "$SETTINGS_FILE" ]]; then
+        printf '{"installed":false,"script_version":%s,"api":%s}\n' "$(json_str "$VERSION")" "$SCRIPT_API"
+        return 0
+    fi
+    load_settings
+    local soar caddy bin="false"
+    soar="$(systemctl is-active unbar-soar 2>/dev/null | head -1 || true)"
+    if [[ "${SERVE_MODE:-caddy}" == "caddy" ]]; then
+        caddy="$(systemctl is-active unbar-caddy 2>/dev/null | head -1 || true)"
+        caddy="${caddy:-unknown}"
+    else
+        caddy="disabled"
+    fi
+    [[ -x "$BIN_DIR/soar-server" ]] && bin="true"
+    printf '{"installed":true,"script_version":%s,"api":%s,"installed_script_version":%s,' \
+        "$(json_str "$VERSION")" "$SCRIPT_API" "$(json_str "$(get_setting SCRIPT_VERSION)")"
+    printf '"soar_version":%s,"soar_binary":%s,"services":{"soar":%s,"caddy":%s},' \
+        "$(json_str "$(installed_soar_tag)")" "$bin" "$(json_str "${soar:-unknown}")" "$(json_str "$caddy")"
+    local port="${HTTPS_PORT:-443}"
+    [[ "$port" =~ ^[0-9]{1,5}$ ]] || port="$(json_str "$port")"
+    printf '"zone":%s,"sub_domain":%s,"https_port":%s,"serve_mode":%s,"sub_file":%s,"name":%s}\n' \
+        "$(json_str "$ZONE")" "$(json_str "$SUB_DOMAIN")" "$port" \
+        "$(json_str "${SERVE_MODE:-caddy}")" "$(json_str "$SUB_FILE")" "$(json_str "$NAME")"
+}
+
+# links: only the sub link and the unbar:// link, in the same layout as `show`
+cmd_links() {
+    need_root
+    load_settings
+    if [[ "${SERVE_MODE:-caddy}" == "caddy" ]]; then
+        echo "Subscription link (enter it in the app):"
+        echo "  $(sub_url)"
+    else
+        echo "Subscription file (put it on an HTTPS host yourself and enter that link in the app):"
+        echo "  $WEB_ROOT/$SUB_FILE"
+    fi
+    echo
+    echo "Direct import link (unbar://):"
+    [[ -s "$LINK_FILE" ]] || die "Link not built yet; run 'unbar-server regen'"
+    echo "  $(cat "$LINK_FILE")"
+}
+
 cmd_regen() {
     need_root
     regen_sub
@@ -993,13 +1177,28 @@ cmd_set() {
     [[ -n "$key" && -n "$value" ]] || die "Usage: unbar-server set <name|zone|sub|email|file|https-port> <value>"
     load_settings
     case "$key" in
-        name)  set_setting NAME "$value" ;;
+        name)
+            valid_name "$value" || die "Invalid name (one line, at most 64 characters)"
+            set_setting NAME "$value"
+            ;;
         zone)
             valid_domain "$value" || die "Invalid zone: $value"
+            # Same rule as setup: the sub subdomain must stay outside the tunnel zone
+            if [[ -n "$SUB_DOMAIN" ]]; then
+                [[ "$SUB_DOMAIN" != "$value" ]] || die "The sub subdomain must not be the same as the zone"
+                case "$SUB_DOMAIN" in
+                    *".$value") die "The sub subdomain must not be under the tunnel zone; change sub first" ;;
+                esac
+            fi
+            local ns_host="ns.${value#*.}"
             set_setting ZONE "$value"
+            # NS host follows the zone exactly as in setup (ns.<parent of the zone>)
+            set_setting NS_HOST "$ns_host"
             write_soar_unit
             systemctl restart unbar-soar
-            warn "Zone changed; also create the new NS record in DNS"
+            warn "Zone changed; create these DNS records (the tunnel works once they propagate):"
+            warn "  NS  $value  -> $ns_host"
+            warn "  A   $ns_host  -> <this server's IP>"
             ;;
         sub)
             valid_domain "$value" || die "Invalid subdomain: $value"
@@ -1023,6 +1222,7 @@ cmd_set() {
             ;;
         https-port)
             [[ "$value" =~ ^[0-9]+$ ]] && [[ "$value" -ge 1 && "$value" -le 65535 ]] || die "Invalid port: $value"
+            [[ "$value" != "53" && "$value" != "80" ]] || die "Port $value cannot be used (53 is the DNS tunnel, 80 is needed for the certificate)"
             [[ "${SERVE_MODE:-caddy}" == "caddy" ]] || die "File mode is on; enable Caddy again with setup first"
             if [[ "$value" != "$HTTPS_PORT" ]] && [[ -n "$(port_holders tcp "$value")" ]]; then
                 die "Port $value is held by $(port_holders tcp "$value" | tr '\n' ' '); pick another free port"
@@ -1030,14 +1230,18 @@ cmd_set() {
             set_setting HTTPS_PORT "$value"
             write_caddyfile
             systemctl reload unbar-caddy 2>/dev/null || systemctl restart unbar-caddy
-            warn "Also open the new port in the firewall and cloud console"
+            open_firewall caddy "$value"
+            warn "Also make sure port $value/tcp is open in your provider's cloud firewall"
             ;;
         file)
             valid_subfile "$value" || die "Invalid file name: $value"
             local old_file="$SUB_FILE"
             set_setting SUB_FILE "$value"
-            write_caddyfile
-            systemctl reload unbar-caddy 2>/dev/null || systemctl restart unbar-caddy
+            # File mode has no Caddy: do not write a Caddyfile or (re)start it
+            if [[ "${SERVE_MODE:-caddy}" == "caddy" ]]; then
+                write_caddyfile
+                systemctl reload unbar-caddy 2>/dev/null || systemctl restart unbar-caddy
+            fi
             # Remove old files so two sub versions do not stay on the server
             [[ "$old_file" != "$value" ]] && rm -f "$WEB_ROOT/$old_file" "$WEB_ROOT/$old_file.txt"
             ;;
@@ -1103,17 +1307,22 @@ reconcile() {
     fi
     # 2) system tuning
     apply_system_tuning
+    # 2b) server DNS: only where unbar already turned the resolved stub off
+    if [[ -f "$RESOLVED_DROPIN" ]]; then
+        apply_resolved_config
+    fi
     # 3) systemd units (restart only if the unit changed)
     ensure_users
-    before="$(cat "$SOAR_UNIT" 2>/dev/null | md5sum)"
+    # (a missing file counts as "changed"; `|| true` keeps set -e/pipefail from aborting)
+    before="$({ cat "$SOAR_UNIT" 2>/dev/null || true; } | md5sum)"
     write_soar_unit
     after="$(md5sum < "$SOAR_UNIT")"
     [[ "$before" == "$after" ]] || restart_soar=1
     if [[ "$SERVE_MODE" == "caddy" ]]; then
-        before="$(cat "$CADDY_UNIT" "$CADDYFILE" 2>/dev/null | md5sum)"
+        before="$({ cat "$CADDY_UNIT" "$CADDYFILE" 2>/dev/null || true; } | md5sum)"
         write_caddyfile
         write_caddy_unit
-        after="$(cat "$CADDY_UNIT" "$CADDYFILE" 2>/dev/null | md5sum)"
+        after="$({ cat "$CADDY_UNIT" "$CADDYFILE" 2>/dev/null || true; } | md5sum)"
         if [[ "$before" != "$after" ]]; then
             systemctl restart unbar-caddy || warn "Restarting caddy failed — check with 'unbar-server logs caddy'"
         fi
@@ -1136,14 +1345,29 @@ cmd_update() {
         exec "$BIN_DIR/$SCRIPT_NAME" update --no-self-update
     fi
     reconcile
+    # Non-zero exit if a service is down after the update (menu 7 and the bot read this)
+    systemctl is-active --quiet unbar-soar || die "soar is not active after the update — check with 'unbar-server logs soar'"
+    if [[ "${SERVE_MODE:-caddy}" == "caddy" ]]; then
+        systemctl is-active --quiet unbar-caddy || die "caddy is not active after the update — check with 'unbar-server logs caddy'"
+    fi
 }
 
-cmd_logs() {
+cmd_logs() {  # cmd_logs [soar|caddy] [N]  |  cmd_logs [N]
     need_root
-    case "${1:-soar}" in
-        soar)  journalctl -u unbar-soar -n 100 --no-pager ;;
-        caddy) journalctl -u unbar-caddy -n 100 --no-pager ;;
-        *) die "Usage: unbar-server logs [soar|caddy]" ;;
+    local what="${1:-}" n="${2:-}"
+    if [[ "$what" =~ ^[0-9]+$ ]]; then
+        n="$what"; what=""
+    fi
+    case "$what" in
+        soar|caddy) n="${n:-100}" ;;
+        "") n="${n:-20}" ;;
+        *) die "Usage: unbar-server logs [N] | logs [soar|caddy] [N]" ;;
+    esac
+    [[ "$n" =~ ^[0-9]+$ ]] && [[ "$n" -ge 1 && "$n" -le 1000 ]] || die "Invalid line count: $n (1-1000)"
+    case "$what" in
+        soar)  journalctl -u unbar-soar -n "$n" --no-pager ;;
+        caddy) journalctl -u unbar-caddy -n "$n" --no-pager ;;
+        "")    journalctl -u unbar-soar -u unbar-caddy -n "$n" --no-pager ;;
     esac
 }
 
@@ -1157,11 +1381,18 @@ cmd_restart() {
     info "Services restarted"
 }
 
-cmd_uninstall() {
+cmd_uninstall() {  # cmd_uninstall [--yes]
     need_root
     warn "Everything will be removed: services, binaries, settings and the server key"
-    ask_yes_no "Are you sure?" "n" || die "Cancelled"
-    local backup="/root/unbar-server-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
+    if [[ "${1:-}" == "--yes" ]]; then
+        info "Confirmed with --yes"
+    elif [[ -n "${1:-}" ]]; then
+        die "Usage: unbar-server uninstall [--yes]"
+    else
+        ask_yes_no "Are you sure?" "n" || die "Cancelled"
+    fi
+    local backup
+    backup="$BACKUP_DIR/unbar-server-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
     if [[ -d "$ETC_DIR" ]]; then
         tar -czf "$backup" -C / "$ETC_DIR" 2>/dev/null || true
         info "Settings and key backed up to $backup"
@@ -1172,6 +1403,7 @@ cmd_uninstall() {
     systemctl daemon-reload
     rm -rf "$ETC_DIR" "$WEB_ROOT" "$BIN_DIR/soar-server"
     remove_system_tuning
+    restore_server_dns
     info "Removed (Caddy and Go binaries are untouched; remove them by hand if you do not want them)"
 }
 
@@ -1311,9 +1543,16 @@ usage() {
     echo "  sudo unbar-server set <key> <value>   Change a setting (name|zone|sub|email|file|https-port)"
     echo "  sudo unbar-server rotate-key       Generate a new key"
     echo "  sudo unbar-server update           Update everything (script, soar-server, tuning, services)"
-    echo "  sudo unbar-server logs [soar|caddy]"
+    echo "  sudo unbar-server logs [N]         Last N lines (default 20) of both services"
+    echo "  sudo unbar-server logs [soar|caddy] [N]"
     echo "  sudo unbar-server restart"
-    echo "  sudo unbar-server uninstall"
+    echo "  sudo unbar-server uninstall [--yes]"
+    echo
+    echo "  Non-interactive (never prompt; non-zero exit on failure):"
+    echo "  sudo unbar-server status --json    Services, versions and settings as JSON"
+    echo "  sudo unbar-server links            Sub link and unbar:// link only"
+    echo "  sudo unbar-server regen-sub        Same as regen"
+    echo "  unbar-server version               Script version and subcommand API level"
 }
 
 main() {
@@ -1322,16 +1561,20 @@ main() {
     [[ "${BASH_VERSINFO[0]:-0}" -ge 4 ]] || die "bash 4 or newer is required (current: $BASH_VERSION)"
     case "$cmd" in
         setup)      cmd_setup ;;
-        status)     cmd_status ;;
+        status)
+            if [[ "${2:-}" == "--json" ]]; then cmd_status_json; else cmd_status; fi
+            ;;
         show)       cmd_show ;;
-        regen)      cmd_regen ;;
+        links)      cmd_links ;;
+        regen|regen-sub) cmd_regen ;;
         set)        shift; cmd_set "${1:-}" "${2:-}" ;;
         rotate-key) cmd_rotate_key ;;
         update)     shift; cmd_update "${1:-}" ;;
-        logs)       shift; cmd_logs "${1:-soar}" ;;
+        logs)       shift; cmd_logs "${1:-}" "${2:-}" ;;
         restart)    cmd_restart ;;
-        uninstall)  cmd_uninstall ;;
+        uninstall)  shift; cmd_uninstall "${1:-}" ;;
         menu)       cmd_menu ;;
+        version|--version) echo "$SCRIPT_NAME $VERSION (api $SCRIPT_API)" ;;
         help|--help|-h) usage ;;
         "")         cmd_menu ;;
         *) error "Unknown command: $cmd"; usage; exit 1 ;;
